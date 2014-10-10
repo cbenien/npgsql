@@ -40,6 +40,12 @@ namespace Npgsql
     /// </summary>
     internal class NpgsqlConnectorPool
     {
+	    private class AvailableConnector
+	    {
+		    public NpgsqlConnector Connector;
+		    public DateTime LastTimeUsed;
+	    }
+
         /// <summary>
         /// A queue with an extra Int32 for keeping track of busy connections.
         /// </summary>
@@ -48,7 +54,7 @@ namespace Npgsql
             /// <summary>
             /// Connections available to the end user
             /// </summary>
-            public Queue<NpgsqlConnector> Available = new Queue<NpgsqlConnector>();
+			public Stack<AvailableConnector> Available = new Stack<AvailableConnector>();
 
             /// <summary>
             /// Connections currently in use
@@ -71,7 +77,8 @@ namespace Npgsql
             PooledConnectors = new Dictionary<string, ConnectorQueue>();
 
             Timer = new Timer(1000);
-            Timer.AutoReset = false;
+            Timer.AutoReset = true;
+	        Timer.Enabled = false;
             Timer.Elapsed += new ElapsedEventHandler(TimerElapsedHandler);
         }
 
@@ -79,7 +86,7 @@ namespace Npgsql
         {
             lock (locker)
             {
-                Timer.Start();
+	            Timer.Enabled = true;
             }
         }
 
@@ -87,6 +94,7 @@ namespace Npgsql
         {
             NpgsqlConnector Connector;
             var activeConnectionsExist = false;
+	        var connectorsToClose = new List<NpgsqlConnector>();
 
             lock (locker)
             {
@@ -98,54 +106,50 @@ namespace Npgsql
                         {
                             if (Queue.Available.Count > 0)
                             {
-                                if (Queue.Available.Count + Queue.Busy.Count > Queue.MinPoolSize)
-                                {
-                                    if (Queue.InactiveTime >= Queue.ConnectionLifeTime)
-                                    {
-                                        Int32 diff = Queue.Available.Count + Queue.Busy.Count - Queue.MinPoolSize;
-                                        Int32 toBeClosed = (diff + 1) / 2;
-                                        toBeClosed = Math.Min(toBeClosed, Queue.Available.Count);
+	                            if (Queue.Available.Count + Queue.Busy.Count > Queue.MinPoolSize)
+	                            {
+		                            var now = DateTime.UtcNow;
+		                            var oldestLastUseTime = now;
 
-                                        if (diff < 2)
-                                        {
-                                            diff = 2;
-                                        }
+		                            foreach (var availableConnector in Queue.Available)
+			                            oldestLastUseTime = availableConnector.LastTimeUsed;
 
-                                        Queue.InactiveTime -= Queue.ConnectionLifeTime / (int)(Math.Log(diff) / Math.Log(2));
+		                            var cutoffTime = now - TimeSpan.FromSeconds(Queue.ConnectionLifeTime);
 
-                                        for (Int32 i = 0; i < toBeClosed; ++i)
-                                        {
-                                            Connector = Queue.Available.Dequeue();
-                                            Connector.Close();
-                                        }
-                                    }
-                                    else
-                                    {
-                                        Queue.InactiveTime++;
-                                    }
-                                }
-                                else
-                                {
-                                    Queue.InactiveTime = 0;
-                                }
-                                if (Queue.Available.Count > 0 || Queue.Busy.Count > 0)
-                                    activeConnectionsExist = true;
+		                            if (oldestLastUseTime < cutoffTime)
+		                            {
+			                            // At least one older connection can be closed
+			                            // and we have to remove items from the bottom of the stack
+			                            // via a temporary list
+
+			                            var availableConnectors = new List<AvailableConnector>();
+			                            while (Queue.Available.Count > 1)
+				                            availableConnectors.Add(Queue.Available.Pop());
+										
+										// Close the oldest connector
+			                            var oldestAvailableConnector = Queue.Available.Pop();
+										connectorsToClose.Add(oldestAvailableConnector.Connector);
+										
+										for (int i = availableConnectors.Count-1; i >= 0; i--)
+				                            Queue.Available.Push(availableConnectors[i]);
+		                            }
+	                            }
                             }
-                            else
-                            {
-                                Queue.InactiveTime = 0;
-                            }
+
+							if (Queue.Available.Count > 0 || Queue.Busy.Count > 0)
+								activeConnectionsExist = true;
                         }
                     }
                 }
                 finally
                 {
-                    if (activeConnectionsExist)
-                        Timer.Start();
-                    else
-                        Timer.Stop();
+	                Timer.Enabled = activeConnectionsExist;
                 }
             }
+
+			// Close connectors outside of global lock
+			foreach (NpgsqlConnector connector in connectorsToClose)
+				connector.Close();
         }
 
         /// <value>Map of index to unused pooled connectors, avaliable to the
@@ -164,7 +168,7 @@ namespace Npgsql
         /// <value>Timer for tracking unused connections in pools.</value>
         // I used System.Timers.Timer because of bad experience with System.Threading.Timer
         // on Windows - it's going mad sometimes and don't respect interval was set.
-        private Timer Timer;
+        private readonly Timer Timer;
 
         /// <summary>
         /// Searches the shared and pooled connector lists for a
@@ -350,7 +354,8 @@ namespace Npgsql
 
                         // Check if the connector is still valid.
 
-                        Connector = Queue.Available.Dequeue();
+	                    var availableConnector = Queue.Available.Pop();
+	                    Connector = availableConnector.Connector;
                         Queue.Busy.Add(Connector, null);
                     }
                 }
@@ -418,7 +423,10 @@ namespace Npgsql
                             Spare.PrivateKeySelectionCallback -= Connection.PrivateKeySelectionCallbackDelegate;
                             Spare.ValidateRemoteCertificateCallback -= Connection.ValidateRemoteCertificateCallbackDelegate;
 
-                            Queue.Available.Enqueue(Spare);
+	                        var availableConnector = new AvailableConnector();
+	                        availableConnector.Connector = Spare;
+	                        availableConnector.LastTimeUsed = DateTime.UtcNow;
+                            Queue.Available.Push(availableConnector);
                         }
                     }
                 }
@@ -536,7 +544,10 @@ namespace Npgsql
                 lock (queue)
                 {
                     queue.Busy.Remove(Connector);
-                    queue.Available.Enqueue(Connector);
+	                var availableConnector = new AvailableConnector();
+	                availableConnector.Connector = Connector;
+	                availableConnector.LastTimeUsed = DateTime.UtcNow;
+	                queue.Available.Push(availableConnector);
                 }
             else
                 lock (queue)
@@ -568,11 +579,11 @@ namespace Npgsql
             {
                 while (Queue.Available.Count > 0)
                 {
-                    NpgsqlConnector connector = Queue.Available.Dequeue();
+                    AvailableConnector availableConnector = Queue.Available.Pop();
 
                     try
                     {
-                        connector.Close();
+                        availableConnector.Connector.Close();
                     }
                     catch
                     {
