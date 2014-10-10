@@ -21,7 +21,6 @@ namespace StressTestTool
 		{
 			int workerThreads, completionPortThreads;
 			ThreadPool.GetAvailableThreads(out workerThreads, out completionPortThreads);
-			//			ThreadPool.GetMaxThreads(out workerThreads, out completionPortThreads);
 			return workerThreads;
 		};
 
@@ -32,11 +31,9 @@ namespace StressTestTool
 			//ThreadPool.SetMaxThreads(2048, 2048);
 			//ThreadPool.SetMinThreads(128, 128);
 
-			var myThreadPool = new SimpleThreadPool(4);
-			enqueue = myThreadPool.QueueUserWorkItem;
-			getFreeThreads = myThreadPool.GetFreeThreads;
-
-			//execute = RemoteCall.Execute;
+			//var myThreadPool = new SimpleThreadPool(4);
+			//enqueue = myThreadPool.QueueUserWorkItem;
+			//getFreeThreads = myThreadPool.GetFreeThreads;
 
 			Console.WriteLine("Running {0}", typeof(NpgsqlConnection).Assembly.FullName);
 
@@ -55,7 +52,9 @@ namespace StressTestTool
 					var newMessage = String.Format("Queries: success={0}, fail={1}  Connections: {2}  Available threads: {3}  Query time: min={4:F3}ms, max={5:F3}ms, avg={6:F3}ms",
 						successfulQueries, failedQueries,
 						openConnections, getFreeThreads(),
-						minElapsedTime.TotalMilliseconds, maxElapsedTime.TotalMilliseconds, totalElapsedTime.TotalMilliseconds / successfulQueries);
+						successfulQueries > 0 ? minElapsedTime.TotalMilliseconds : 0, 
+						successfulQueries > 0 ? maxElapsedTime.TotalMilliseconds : 0, 
+						successfulQueries > 0 ? totalElapsedTime.TotalMilliseconds / successfulQueries : 0);
 
 					if (newMessage != lastMessage)
 					{
@@ -171,7 +170,7 @@ namespace StressTestTool
 				"Server={0};Port={1};Database={2};User Id={3};Password={4};Pooling={5};" +
 				"MinPoolSize={6};MaxPoolSize={7};ConnectionLifeTime={8};Timeout={9};CommandTimeout={10};",
 				hostname, port, databaseName, user, password, "true",
-				0, 2, 15, 240, 240);
+				0, 2, 15, 30, 30);
 			query = "select 42 as result;";
 		}
 
