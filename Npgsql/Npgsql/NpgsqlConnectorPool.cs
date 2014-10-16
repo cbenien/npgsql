@@ -181,27 +181,23 @@ namespace Npgsql
         public NpgsqlConnector RequestConnector(NpgsqlConnection Connection)
         {
             NpgsqlConnector Connector;
-            Int32 timeoutMilliseconds = Connection.Timeout * 1000;
 
-            // No need for this lock anymore
-            //lock (this)
-            {
-                Connector = RequestPooledConnectorInternal(Connection);
-            }
 
+	        var startRequestTime = DateTime.UtcNow;
+	        var queue = GetConnectorQueue(Connection);
+			Connector = RequestPooledConnectorInternal(Connection, queue);
+			
+			int timeoutMilliseconds = Connection.Timeout * 1000;
             while (Connector == null && timeoutMilliseconds > 0)
             {
-
-                Int32 ST = timeoutMilliseconds > 1000 ? 1000 : timeoutMilliseconds;
-
-                Thread.Sleep(ST);
-                timeoutMilliseconds -= ST;
-
-                //lock (this)
-                {
-                    Connector = RequestPooledConnectorInternal(Connection);
-                }
-            }
+	            lock (queue)
+	            {
+		            Monitor.Wait(queue, timeoutMilliseconds);
+	            }
+				
+                Connector = RequestPooledConnectorInternal(Connection, queue);
+				timeoutMilliseconds = (int)((startRequestTime + TimeSpan.FromSeconds(Connection.Timeout)) - DateTime.UtcNow).TotalMilliseconds;
+			}
 
             if (Connector == null)
             {
@@ -223,7 +219,7 @@ namespace Npgsql
         /// <summary>
         /// Find a pooled connector.  Handle shared/non-shared here.
         /// </summary>
-        private NpgsqlConnector RequestPooledConnectorInternal(NpgsqlConnection Connection)
+        private NpgsqlConnector RequestPooledConnectorInternal(NpgsqlConnection Connection, ConnectorQueue Queue)
         {
             NpgsqlConnector Connector = null;
             Boolean Shared = false;
@@ -237,7 +233,7 @@ namespace Npgsql
                 throw new NotImplementedException("Internal: Shared pooling not implemented");
 
             }
-            Connector = GetPooledConnector(Connection);
+            Connector = GetPooledConnector(Connection, Queue);
 
             return Connector;
         }
@@ -305,13 +301,32 @@ namespace Npgsql
             }
         }
 
+		private ConnectorQueue GetConnectorQueue(NpgsqlConnection Connection)
+	    {
+			ConnectorQueue Queue = null;
+
+			// We only need to lock all pools when trying to get one pool or create one.
+			lock (locker)
+			{
+				// Try to find a queue.
+				if (!PooledConnectors.TryGetValue(Connection.ConnectionString, out Queue))
+				{
+					Queue = new ConnectorQueue();
+					Queue.ConnectionLifeTime = Connection.ConnectionLifeTime;
+					Queue.MinPoolSize = Connection.MinPoolSize;
+					PooledConnectors[Connection.ConnectionString] = Queue;
+				}
+
+				return Queue;
+			}
+	    }
+
         /// <summary>
         /// Find an available pooled connector in the non-shared pool, or create
         /// a new one if none found.
         /// </summary>
-        private NpgsqlConnector GetPooledConnector(NpgsqlConnection Connection)
+        private NpgsqlConnector GetPooledConnector(NpgsqlConnection Connection, ConnectorQueue Queue)
         {
-            ConnectorQueue Queue = null;
             NpgsqlConnector Connector = null;
 
             do
@@ -329,23 +344,6 @@ namespace Npgsql
                     Connector = null;
                 }
 
-                // We only need to lock all pools when trying to get one pool or create one.
-
-                lock (locker)
-                {
-
-                    // Try to find a queue.
-                    if (!PooledConnectors.TryGetValue(Connection.ConnectionString, out Queue))
-                    {
-
-                        Queue = new ConnectorQueue();
-                        Queue.ConnectionLifeTime = Connection.ConnectionLifeTime;
-                        Queue.MinPoolSize = Connection.MinPoolSize;
-                        PooledConnectors[Connection.ConnectionString] = Queue;
-                    }
-                }
-
-                // Now we can simply lock on the pool itself.
                 lock (Queue)
                 {
                     if (Queue.Available.Count > 0)
@@ -544,10 +542,14 @@ namespace Npgsql
                 lock (queue)
                 {
                     queue.Busy.Remove(Connector);
-	                var availableConnector = new AvailableConnector();
+
+					var availableConnector = new AvailableConnector();
 	                availableConnector.Connector = Connector;
 	                availableConnector.LastTimeUsed = DateTime.UtcNow;
 	                queue.Available.Push(availableConnector);
+
+					// Notify the first waiting call to RequestConnector in a FIFO order
+					Monitor.Pulse(queue);
                 }
             else
                 lock (queue)
@@ -593,6 +595,9 @@ namespace Npgsql
 
                 //Clear the busy list so that the current connections don't get re-added to the queue
                 Queue.Busy.Clear();
+
+				// wake up every thread waiting in RequestConnector
+				Monitor.PulseAll(Queue);
             }
         }
 
