@@ -98,21 +98,12 @@ namespace Npgsql
                 IAsyncResult result;
                 // Keep track of time remaining; Even though there may be multiple timeout-able calls,
                 // this allows us to still respect the caller's timeout expectation.
-                DateTime attemptStart;
+                DateTime attemptStart = DateTime.Now;
+                IPAddress[] ips = Dns.GetHostAddresses(context.Host);
 
-                attemptStart = DateTime.Now;
+				timeout -= Convert.ToInt32((DateTime.Now - attemptStart).TotalMilliseconds);
+	            attemptStart = DateTime.Now;
 
-                result = Dns.BeginGetHostAddresses(context.Host, null, null);
-
-                if (!result.AsyncWaitHandle.WaitOne(timeout, true))
-                {
-                    // Timeout was used up attempting the Dns lookup
-                    throw new TimeoutException(resman.GetString("Exception_DnsLookupTimeout"));
-                }
-
-                timeout -= Convert.ToInt32((DateTime.Now - attemptStart).TotalMilliseconds);
-
-                IPAddress[] ips = Dns.EndGetHostAddresses(result);
                 Socket socket = null;
                 Exception lastSocketException = null;
 
