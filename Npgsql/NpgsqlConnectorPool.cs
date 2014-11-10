@@ -415,7 +415,7 @@ namespace Npgsql
             }
             */
 
-            if (!Connector.IsInitialized)
+            if (!Connector.IsConnected)
             {
                 if (Connector.Transaction != null)
                 {
@@ -441,7 +441,7 @@ namespace Npgsql
 
             bool inQueue = queue.Busy.ContainsKey(Connector);
 
-            if (Connector.State == NpgsqlState.Ready)
+            if (Connector.State == ConnectorState.Ready)
             {
                 //If thread is good
                 if ((Thread.CurrentThread.ThreadState & (ThreadState.Aborted | ThreadState.AbortRequested)) == 0)

@@ -32,7 +32,10 @@ using System.ComponentModel;
 using System.Data;
 using System.Data.Common;
 using System.IO;
+using System.Runtime.CompilerServices;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using Common.Logging;
 using Npgsql.Localization;
 using NpgsqlTypes;
@@ -47,7 +50,7 @@ namespace Npgsql
     [System.Drawing.ToolboxBitmapAttribute(typeof(NpgsqlCommand)), ToolboxItem(true)]
 #endif
     [System.ComponentModel.DesignerCategory("")]    
-    public sealed class NpgsqlCommand : DbCommand, ICloneable
+    public sealed partial class NpgsqlCommand : DbCommand, ICloneable
     {
         #region Fields
 
@@ -55,14 +58,12 @@ namespace Npgsql
         NpgsqlConnector _connector;
         NpgsqlTransaction _transaction;
         String _commandText;
-        int _timeout;
+        int? _timeout;
         readonly NpgsqlParameterCollection _parameters = new NpgsqlParameterCollection();
         String _planName;
 
         PrepareStatus _prepared = PrepareStatus.NotPrepared;
         byte[] _preparedCommandText;
-        NpgsqlBind _bind;
-        NpgsqlExecute _execute;
         NpgsqlRowDescription _currentRowDescription;
 
         long _lastInsertedOid;
@@ -71,14 +72,15 @@ namespace Npgsql
         bool _functionChecksDone;
         bool _functionNeedsColumnListDefinition; // Functions don't return record by default.
 
-        bool _commandTimeoutSet;
-
         UpdateRowSource _updateRowSource = UpdateRowSource.Both;
 
-        bool _disposed;
         static readonly Array ParamNameCharTable;
         internal Type[] ExpectedTypes { get; set; }
 
+        short[] _resultFormatCodes;
+
+        internal const int DefaultTimeout = 20;
+        const string AnonymousPortal = "";
         static readonly ILog _log = LogManager.GetCurrentClassLogger();
 
         #endregion Fields
@@ -128,23 +130,9 @@ namespace Npgsql
         {
             _planName = String.Empty;
             _commandText = cmdText;
-            _connection = connection;
-
-            if (_connection != null)
-            {
-                _connector = connection.Connector;
-
-                if (_connector != null && _connector.AlwaysPrepare)
-                {
-                    CommandTimeout = _connector.DefaultCommandTimeout;
-                    _prepared = PrepareStatus.NeedsPrepare;
-                }
-            }
-
+            Connection = connection;
             CommandType = CommandType.Text;
             Transaction = transaction;
-
-            SetCommandTimeout();
         }
 
         /// <summary>
@@ -191,10 +179,17 @@ namespace Npgsql
         /// </summary>
         /// <value>The time (in seconds) to wait for the command to execute.
         /// The default is 20 seconds.</value>
-        [DefaultValue(20)]
+        [DefaultValue(DefaultTimeout)]
         public override int CommandTimeout
         {
-            get { return _timeout; }
+            get
+            {
+                return _timeout ?? (
+                    _connection != null
+                      ? _connection.CommandTimeout
+                      : (int)NpgsqlConnectionStringBuilder.GetDefaultValue(Keywords.CommandTimeout)
+                );
+            }
             set
             {
                 if (value < 0) {
@@ -202,7 +197,6 @@ namespace Npgsql
                 }
 
                 _timeout = value;
-                _commandTimeoutSet = true;
             }
         }
 
@@ -251,19 +245,19 @@ namespace Npgsql
                     throw new InvalidOperationException(L10N.SetConnectionInTransaction);
                 }
 
+                if (_connection != null) {
+                    _connection.StateChange -= OnConnectionStateChange;
+                }
                 _connection = value;
+                if (_connection != null) {
+                    _connection.StateChange += OnConnectionStateChange;
+                }
                 Transaction = null;
                 if (_connection != null)
                 {
                     _connector = _connection.Connector;
-
-                    if (_connector != null && _connector.AlwaysPrepare)
-                    {
-                        _prepared = PrepareStatus.NeedsPrepare;
-                    }
+                    _prepared = _connector != null && _connector.AlwaysPrepare ? PrepareStatus.NeedsPrepare : PrepareStatus.NotPrepared;
                 }
-
-                SetCommandTimeout();
             }
         }
 
@@ -309,7 +303,74 @@ namespace Npgsql
             get { return _lastInsertedOid; }
         }
 
+        /// <summary>
+        /// Returns whether this query will execute as a prepared (compiled) query.
+        /// </summary>
+        public bool IsPrepared
+        {
+            get
+            {
+                switch (_prepared)
+                {
+                    case PrepareStatus.NotPrepared:
+                        return false;
+                    case PrepareStatus.NeedsPrepare:
+                    case PrepareStatus.Prepared:
+                        return true;
+                    default:
+                        throw new ArgumentOutOfRangeException();
+                }
+            }
+        }
+
         #endregion Public properties
+
+        #region State management
+
+        volatile int _state;
+
+        /// <summary>
+        /// Gets the current state of the connector
+        /// </summary>
+        internal CommandState State
+        {
+            get { return (CommandState)_state; }
+            set
+            {
+                var newState = (int)value;
+                if (newState == _state)
+                    return;
+                Interlocked.Exchange(ref _state, newState);
+            }
+        }
+
+        void OnConnectionStateChange(object sender, StateChangeEventArgs stateChangeEventArgs)
+        {
+            switch (stateChangeEventArgs.CurrentState)
+            {
+                case ConnectionState.Broken:
+                case ConnectionState.Closed:
+                    _prepared = PrepareStatus.NotPrepared;
+                    break;
+                case ConnectionState.Open:
+                    switch (stateChangeEventArgs.OriginalState)
+                    {
+                        case ConnectionState.Closed:
+                        case ConnectionState.Broken:
+                            _prepared = _connector != null && _connector.AlwaysPrepare ? PrepareStatus.NeedsPrepare : PrepareStatus.NotPrepared;
+                            break;
+                    }
+                    break;
+                case ConnectionState.Connecting:
+                case ConnectionState.Executing:
+                case ConnectionState.Fetching:
+                    return;
+                default:
+                    throw new ArgumentOutOfRangeException();
+            }
+        }
+
+        #endregion State management
 
         #region Parameters
 
@@ -398,39 +459,82 @@ namespace Npgsql
             const string portalName = "";
 
             _preparedCommandText = GetCommandText(true);
-            var parse = new NpgsqlParse(_planName, _preparedCommandText, new int[] { });
-            var statementDescribe = new NpgsqlDescribeStatement(_planName);
             NpgsqlRowDescription returnRowDesc = null;
+            ParameterDescriptionResponse parameterDescription = null;
+
+
+            var numInputParameters = 0;
+            for (var i = 0; i < _parameters.Count; i++)
+            {
+                if (_parameters[i].IsInputDirection)
+                {
+                    numInputParameters++;
+                }
+            }
+
+            var parameterTypeOIDs = new int[numInputParameters];
+
+            for (int i = 0, j = 0; i < _parameters.Count; i++)
+            {
+                if (_parameters[i].IsInputDirection)
+                {
+                    parameterTypeOIDs[j++] = _parameters[i].TypeInfo.NpgsqlDbType == NpgsqlDbType.Unknown ? 0 : _connector.OidToNameMapping[_parameters[i].TypeInfo.Name].OID;
+                }
+            }
 
             // Write Parse, Describe, and Sync messages to the wire.
-            _connector.Parse(parse);
-            _connector.Describe(statementDescribe);
-            _connector.Sync();
+            _connector.SendParse(_planName, _preparedCommandText, parameterTypeOIDs);
+            _connector.SendDescribeStatement(_planName);
+            _connector.SendSync();
 
             // Tell to mediator what command is being sent.
             _connector.Mediator.SetSqlSent(_preparedCommandText, NpgsqlMediator.SQLSentType.Parse);
 
-            // Flush and wait for response.
-            var responseEnum = _connector.ProcessBackendResponsesEnum();
-
-            // Look for a NpgsqlRowDescription in the responses, discarding everything else.
-            foreach (var response in responseEnum)
+            // Look for ParameterDescriptionResponse, NpgsqlRowDescription in the responses, discarding everything else.
+            while (true)
             {
-                if (response is NpgsqlRowDescription)
-                {
-                    returnRowDesc = (NpgsqlRowDescription)response;
+                var msg = _connector.ReadMessage();
+                if (msg is ReadyForQueryMsg) {
+                    break;
                 }
-                else if (response is IDisposable)
+                var asParameterDescription = msg as ParameterDescriptionResponse;
+                if (asParameterDescription != null)
                 {
-                    (response as IDisposable).Dispose();
+                    parameterDescription = asParameterDescription;
+                    continue;
+                }
+                var asRowDesc = msg as NpgsqlRowDescription;
+                if (asRowDesc != null)
+                {
+                    returnRowDesc = asRowDesc;
+                    continue;
+                }
+                var asDisposable = msg as IDisposable;
+                if (asDisposable != null)
+                {
+                    asDisposable.Dispose();
                 }
             }
 
-            short[] resultFormatCodes;
+            if (parameterDescription != null)
+            {
+                if (parameterDescription.TypeOIDs.Length != numInputParameters)
+                {
+                    throw new InvalidOperationException("Wrong number of parameters. Got " + numInputParameters + " but expected " + parameterDescription.TypeOIDs.Length + ".");
+                }
+
+                for (int i = 0, j = 0; j < numInputParameters; i++)
+                {
+                    if (_parameters[i].IsInputDirection)
+                    {
+                        _parameters[i].SetTypeOID(parameterDescription.TypeOIDs[j++], _connector.NativeToBackendTypeConverterOptions);
+                    }
+                }
+            }
 
             if (returnRowDesc != null)
             {
-                resultFormatCodes = new short[returnRowDesc.NumFields];
+                _resultFormatCodes = new short[returnRowDesc.NumFields];
 
                 for (var i = 0; i < returnRowDesc.NumFields; i++)
                 {
@@ -443,27 +547,22 @@ namespace Npgsql
                         // here based on support for binary encoding.  Once this is done,
                         // there is no need to request another row description after Bind.
                         returnRowDescData.FormatCode = returnRowDescData.TypeInfo.SupportsBinaryBackendData ? FormatCode.Binary : FormatCode.Text;
-                        resultFormatCodes[i] = (short)returnRowDescData.FormatCode;
+                        _resultFormatCodes[i] = (short)returnRowDescData.FormatCode;
                     }
                     else
                     {
                         // Text format (default).
-                        resultFormatCodes[i] = (short)FormatCode.Text;
+                        _resultFormatCodes[i] = (short)FormatCode.Text;
                     }
                 }
             }
             else
             {
-                resultFormatCodes = new short[] { 0 };
+                _resultFormatCodes = new short[] { 0 };
             }
 
             // Save the row description for use with all future Executes.
             _currentRowDescription = returnRowDesc;
-
-            // The Bind and Execute message objects live through multiple Executes.
-            // Only Bind changes at all between Executes, which is done in BindParameters().
-            _bind = new NpgsqlBind(portalName, _planName, new Int16[Parameters.Count], null, resultFormatCodes);
-            _execute = new NpgsqlExecute(portalName, 0);
 
             _prepared = PrepareStatus.Prepared;
         }
@@ -473,8 +572,6 @@ namespace Npgsql
             if (_prepared == PrepareStatus.Prepared)
             {
                 _connector.ExecuteBlind("DEALLOCATE " + _planName);
-                _bind = null;
-                _execute = null;
                 _currentRowDescription = null;
                 _prepared = PrepareStatus.NeedsPrepare;
             }
@@ -518,7 +615,7 @@ namespace Npgsql
             var seenDef = false;
             foreach (NpgsqlParameter p in Parameters)
             {
-                if ((p.Direction == ParameterDirection.Input) || (p.Direction == ParameterDirection.InputOutput))
+                if (p.IsInputDirection)
                 {
                     parameterTypes.Append(Connection.Connector.OidToNameMapping[p.TypeInfo.Name].OID.ToString() + " ");
                 }
@@ -607,10 +704,9 @@ namespace Npgsql
                             st.WriteString(", ");
                         }
 
-                        st
-                            .WriteString(p.CleanName)
-                            .WriteBytes((byte)ASCIIBytes.Space)
-                            .WriteString(p.TypeInfo.Name);
+                        st.WriteString(p.CleanName);
+                        st.WriteByte((byte) ASCIIBytes.Space);
+                        st.WriteString(p.TypeInfo.Name);
 
                         break;
                 }
@@ -666,7 +762,7 @@ namespace Npgsql
                 {
                     commandBuilder
                         .WriteString(_commandText)
-                        .WriteBytes((byte)ASCIIBytes.ParenLeft);
+                        .WriteByte((byte)ASCIIBytes.ParenLeft);
 
                     if (prepare)
                     {
@@ -677,7 +773,7 @@ namespace Npgsql
                         AppendParameterValues(commandBuilder);
                     }
 
-                    commandBuilder.WriteBytes((byte)ASCIIBytes.ParenRight);
+                    commandBuilder.WriteByte((byte)ASCIIBytes.ParenRight);
                 }
 
                 if (!prepare && _functionNeedsColumnListDefinition)
@@ -704,10 +800,7 @@ namespace Npgsql
             {
                 var parameter = _parameters[i];
 
-                if (
-                    (parameter.Direction == ParameterDirection.Input) ||
-                    (parameter.Direction == ParameterDirection.InputOutput)
-                )
+                if (parameter.IsInputDirection)
                 {
                     if (first)
                     {
@@ -725,25 +818,18 @@ namespace Npgsql
 
         void AppendParameterPlaceHolder(Stream dest, NpgsqlParameter parameter, int paramNumber)
         {
-            var parameterSize = "";
+            dest.WriteByte((byte)ASCIIBytes.ParenLeft);
 
-            dest.WriteBytes((byte)ASCIIBytes.ParenLeft);
-
-            if (parameter.TypeInfo.UseSize && (parameter.Size > 0))
+            if (parameter.UseCast && parameter.Size > 0)
             {
-                parameterSize = string.Format("({0})", parameter.Size);
-            }
-
-            if (parameter.UseCast)
-            {
-                dest.WriteString("${0}::{1}{2}", paramNumber, parameter.TypeInfo.CastName, parameterSize);
+                dest.WriteString("${0}::{1}", paramNumber, parameter.TypeInfo.GetCastName(parameter.Size));
             }
             else
             {
-                dest.WriteString("${0}{1}", paramNumber, parameterSize);
+                dest.WriteString("$" + paramNumber);
             }
 
-            dest.WriteBytes((byte)ASCIIBytes.ParenRight);
+            dest.WriteByte((byte)ASCIIBytes.ParenRight);
         }
 
         void AppendParameterValues(Stream dest)
@@ -754,10 +840,7 @@ namespace Npgsql
             {
                 var parameter = _parameters[i];
 
-                if (
-                    (parameter.Direction == ParameterDirection.Input) ||
-                    (parameter.Direction == ParameterDirection.InputOutput)
-                )
+                if (parameter.IsInputDirection)
                 {
                     if (first)
                     {
@@ -781,23 +864,17 @@ namespace Npgsql
             // See bug #1010543
             // Check if this parenthesis can be collapsed with the previous one about the array support. This way, we could use
             // only one pair of parentheses for the two purposes instead of two pairs.
-            dest
-                .WriteBytes((byte)ASCIIBytes.ParenLeft)
-                .WriteBytes((byte)ASCIIBytes.ParenLeft)
-                .WriteBytes(serialised)
-                .WriteBytes((byte)ASCIIBytes.ParenRight);
+            dest.WriteByte((byte)ASCIIBytes.ParenLeft);
+            dest.WriteByte((byte) ASCIIBytes.ParenLeft);
+            dest.WriteBytes(serialised);
+            dest.WriteByte((byte)ASCIIBytes.ParenRight);
 
             if (parameter.UseCast)
             {
-                dest.WriteString("::{0}", parameter.TypeInfo.CastName);
-
-                if (parameter.TypeInfo.UseSize && (parameter.Size > 0))
-                {
-                    dest.WriteString("({0})", parameter.Size);
-                }
+                dest.WriteString("::{0}", parameter.TypeInfo.GetCastName(parameter.Size));
             }
 
-            dest.WriteBytes((byte)ASCIIBytes.ParenRight);
+            dest.WriteByte((byte)ASCIIBytes.ParenRight);
         }
 
         static bool IsParamNameChar(char ch)
@@ -840,7 +917,7 @@ namespace Npgsql
         /// <returns>false if the query has multiple statements which are not allowed</returns>
         bool AppendCommandReplacingParameterValues(Stream dest, string src, bool prepare, bool allowMultipleStatements)
         {
-            var standardConformantStrings = _connection != null && _connection.Connector != null && _connection.Connector.IsInitialized ? _connection.UseConformantStrings : true;
+            var standardConformantStrings = _connection != null && _connection.Connector != null && _connection.Connector.IsConnected ? _connection.UseConformantStrings : true;
 
             var currCharOfs = 0;
             var end = src.Length;
@@ -857,9 +934,12 @@ namespace Npgsql
             {
                 paramOrdinalMap = new Dictionary<NpgsqlParameter, int>();
 
-                for (int i = 0; i < _parameters.Count; i++)
+                for (int i = 0, cnt = 0; i < _parameters.Count; i++)
                 {
-                    paramOrdinalMap[_parameters[i]] = i + 1;
+                    if (_parameters[i].IsInputDirection)
+                    {
+                        paramOrdinalMap[_parameters[i]] = ++cnt;
+                    }
                 }
             }
 
@@ -934,7 +1014,7 @@ namespace Npgsql
 
                     if (_parameters.TryGetValue(paramName, out parameter))
                     {
-                        if (parameter.Direction == ParameterDirection.Input || parameter.Direction == ParameterDirection.InputOutput)
+                        if (parameter.IsInputDirection)
                         {
                             if (prepare)
                             {
@@ -1248,20 +1328,14 @@ namespace Npgsql
 
                     byte[] serialization;
 
-                    serialization = p.TypeInfo.ConvertToBackend(p.Value, false, Connector.NativeToBackendTypeConverterOptions);
+                    serialization = p.TypeInfo.ConvertToBackend(p.NpgsqlValue, false, Connector.NativeToBackendTypeConverterOptions);
 
-                    result
-                        .WriteBytes(serialization)
-                        .WriteBytes((byte)ASCIIBytes.ParenRight);
+                    result.WriteBytes(serialization);
+                    result.WriteByte((byte)ASCIIBytes.ParenRight);
 
                     if (p.UseCast)
                     {
-                        result.WriteString(string.Format("::{0}", p.TypeInfo.CastName));
-
-                        if (p.TypeInfo.UseSize && (p.Size > 0))
-                        {
-                            result.WriteString("({0})", p.Size);
-                        }
+                        result.WriteString(string.Format("::{0}", p.TypeInfo.GetCastName(p.Size)));
                     }
                 }
 
@@ -1273,13 +1347,54 @@ namespace Npgsql
 
         #endregion Query preparation
 
-        #region Execute
+        #region Execute Non Query
 
         /// <summary>
         /// Executes a SQL statement against the connection and returns the number of rows affected.
         /// </summary>
         /// <returns>The number of rows affected if known; -1 otherwise.</returns>
         public override int ExecuteNonQuery()
+        {
+            return ExecuteNonQueryInternal();
+        }
+
+        /// <summary>
+        /// Asynchronous version of <see cref="ExecuteNonQuery"/>
+        /// </summary>
+        /// <param name="cancellationToken">The token to monitor for cancellation requests.</param>
+        /// <returns>A task representing the asynchronous operation, with the number of rows affected if known; -1 otherwise.</returns>
+#if NET45
+        public override async Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
+#else
+        public async Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
+#endif
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            cancellationToken.Register(Cancel);
+            try
+            {
+                return await ExecuteNonQueryInternalAsync();
+            }
+            catch (NpgsqlException e)
+            {
+                if (e.Code == "57014")
+                    throw new TaskCanceledException(e.Message);
+                throw;
+            }
+        }
+
+#if !NET45
+        public Task<int> ExecuteNonQueryAsync()
+        {
+            return ExecuteNonQueryAsync(CancellationToken.None);
+        }
+#endif
+
+#if NET45
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+#endif
+        [GenerateAsync]
+        int ExecuteNonQueryInternal()
         {
             _log.Debug("ExecuteNonQuery");
             //We treat this as a simple wrapper for calling ExecuteReader() and then
@@ -1301,6 +1416,10 @@ namespace Npgsql
             return ret ?? -1;
         }
 
+        #endregion Execute Non Query
+
+        #region Execute Scalar
+
         /// <summary>
         /// Executes the query, and returns the first column of the first row
         /// in the result set returned by the query. Extra columns or rows are ignored.
@@ -1309,57 +1428,176 @@ namespace Npgsql
         /// or a null reference if the result set is empty.</returns>
         public override Object ExecuteScalar()
         {
+            return ExecuteScalarInternal();
+        }
+
+        /// <summary>
+        /// Asynchronous version of <see cref="ExecuteScalar"/>
+        /// </summary>
+        /// <param name="cancellationToken">The token to monitor for cancellation requests.</param>
+        /// <returns>A task representing the asynchronous operation, with the first column of the
+        /// first row in the result set, or a null reference if the result set is empty.</returns>
+#if NET45
+        public override async Task<object> ExecuteScalarAsync(CancellationToken cancellationToken)
+#else
+        public async Task<object> ExecuteScalarAsync(CancellationToken cancellationToken)
+#endif
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            cancellationToken.Register(Cancel);
+            try
+            {
+                return await ExecuteScalarInternalAsync();
+            }
+            catch (NpgsqlException e)
+            {
+                if (e.Code == "57014")
+                    throw new TaskCanceledException(e.Message);
+                throw;
+            }
+        }
+
+#if !NET45
+        public Task<object> ExecuteScalarAsync()
+        {
+            return ExecuteScalarAsync(CancellationToken.None);
+        }
+#endif
+
+#if NET45
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+#endif
+        [GenerateAsync]
+        object ExecuteScalarInternal()
+        {
             using (var reader = GetReader(CommandBehavior.SequentialAccess | CommandBehavior.SingleResult | CommandBehavior.SingleRow))
             {
                 return reader.Read() && reader.FieldCount != 0 ? reader.GetValue(0) : null;
             }
         }
 
-        /// <summary>
-        /// Sends the <see cref="NpgsqlCommand.CommandText">CommandText</see> to
-        /// the <see cref="NpgsqlConnection">Connection</see> and builds a
-        /// <see cref="NpgsqlDataReader">NpgsqlDataReader</see>
-        /// using one of the <see cref="System.Data.CommandBehavior">CommandBehavior</see> values.
-        /// </summary>
-        /// <param name="behavior">One of the <see cref="System.Data.CommandBehavior">CommandBehavior</see> values.</param>
-        /// <returns>A <see cref="NpgsqlDataReader">NpgsqlDataReader</see> object.</returns>
-        protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
-        {
-            return ExecuteReader(behavior);
-        }
+        #endregion Execute Scalar
+
+        #region Execute Reader
 
         /// <summary>
-        /// Sends the <see cref="NpgsqlCommand.CommandText">CommandText</see> to
-        /// the <see cref="NpgsqlConnection">Connection</see> and builds a
-        /// <see cref="NpgsqlDataReader">NpgsqlDataReader</see>.
+        /// Executes the CommandText against the Connection, and returns an DbDataReader.
         /// </summary>
-        /// <returns>A <see cref="NpgsqlDataReader">NpgsqlDataReader</see> object.</returns>
+        /// <remarks>
+        /// Unlike the ADO.NET method which it replaces, this method returns a Npgsql-specific
+        /// DataReader.
+        /// </remarks>
+        /// <returns>A DbDataReader object.</returns>
         public new NpgsqlDataReader ExecuteReader()
         {
-            return ExecuteReader(CommandBehavior.Default);
+            return (NpgsqlDataReader)base.ExecuteReader();
         }
 
         /// <summary>
-        /// Sends the <see cref="NpgsqlCommand.CommandText">CommandText</see> to
-        /// the <see cref="NpgsqlConnection">Connection</see> and builds a
-        /// <see cref="NpgsqlDataReader">NpgsqlDataReader</see>
-        /// using one of the <see cref="System.Data.CommandBehavior">CommandBehavior</see> values.
+        /// Executes the CommandText against the Connection, and returns an DbDataReader using one
+        /// of the CommandBehavior values.
         /// </summary>
-        /// <param name="cb">One of the <see cref="System.Data.CommandBehavior">CommandBehavior</see> values.</param>
-        /// <returns>A <see cref="NpgsqlDataReader">NpgsqlDataReader</see> object.</returns>
-        /// <remarks>Currently the CommandBehavior parameter is ignored.</remarks>
-        public new NpgsqlDataReader ExecuteReader(CommandBehavior cb)
+        /// <remarks>
+        /// Unlike the ADO.NET method which it replaces, this method returns a Npgsql-specific
+        /// DataReader.
+        /// </remarks>
+        /// <returns>A DbDataReader object.</returns>
+        public new NpgsqlDataReader ExecuteReader(CommandBehavior behavior)
         {
-            _log.Debug("ExecuteReader with CommandBehavior=" + cb);
+            return (NpgsqlDataReader)base.ExecuteReader(behavior);
+        }
 
+#if NET45
+        protected async override Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            cancellationToken.Register(Cancel);
+            try
+            {
+                return await ExecuteDbDataReaderInternalAsync(behavior);
+            }
+            catch (NpgsqlException e)
+            {
+                if (e.Code == "57014")
+                    throw new TaskCanceledException(e.Message);
+                throw;
+            }
+        }
+#else
+        /// <summary>
+        /// Executes the CommandText against the Connection, and returns an DbDataReader using one
+        /// of the CommandBehavior values.
+        /// </summary>
+        /// <returns>A DbDataReader object.</returns>
+        public async Task<NpgsqlDataReader> ExecuteReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            cancellationToken.Register(Cancel);
+            try
+            {
+                return await ExecuteDbDataReaderInternalAsync(behavior);
+            }
+            catch (NpgsqlException e)
+            {
+                if (e.Code == "57014")
+                    throw new TaskCanceledException(e.Message);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Asynchronously executes the CommandText against the Connection, and returns an DbDataReader.
+        /// </summary>
+        /// <returns>A DbDataReader object.</returns>
+        public Task<NpgsqlDataReader> ExecuteReaderAsync(CancellationToken cancellationToken)
+        {
+            return ExecuteReaderAsync(CommandBehavior.Default, CancellationToken.None);
+        }
+
+        /// <summary>
+        /// Executes the CommandText against the Connection, and returns an DbDataReader using one
+        /// of the CommandBehavior values.
+        /// </summary>
+        /// <returns>A DbDataReader object.</returns>
+        public Task<NpgsqlDataReader> ExecuteReaderAsync(CommandBehavior behavior)
+        {
+            return ExecuteReaderAsync(behavior, CancellationToken.None);
+        }
+
+        /// <summary>
+        /// Executes the CommandText against the Connection, and returns an DbDataReader using one
+        /// of the CommandBehavior values.
+        /// </summary>
+        /// <returns>A DbDataReader object.</returns>
+        public Task<NpgsqlDataReader> ExecuteReaderAsync()
+        {
+            return ExecuteReaderAsync(CommandBehavior.Default, CancellationToken.None);
+        }
+#endif
+
+        /// <summary>
+        /// Executes the command text against the connection.
+        /// </summary>
+        protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
+        {
+            _log.Debug("ExecuteReader with CommandBehavior=" + behavior);
+            return ExecuteDbDataReaderInternal(behavior);
+        }
+
+#if NET45
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+#endif
+        [GenerateAsync]
+        NpgsqlDataReader ExecuteDbDataReaderInternal(CommandBehavior behavior)
+        {
             // Close connection if requested even when there is an error.
             try
             {
-                return GetReader(cb);
+                return GetReader(behavior);
             }
             catch (Exception)
             {
-                if ((cb & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
+                if ((behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
                 {
                     _connection.Close();
                 }
@@ -1368,6 +1606,7 @@ namespace Npgsql
             }
         }
 
+        [GenerateAsync]
         internal NpgsqlDataReader GetReader(CommandBehavior cb)
         {
             CheckConnectionState();
@@ -1375,7 +1614,8 @@ namespace Npgsql
             // Block the notification thread before writing anything to the wire.
             using (_connector.BlockNotificationThread())
             {
-                IEnumerable<IServerResponseObject> responseEnum;
+                State = CommandState.InProgress;
+
                 NpgsqlDataReader reader;
 
                 _connector.SetBackendCommandTimeout(CommandTimeout);
@@ -1387,12 +1627,10 @@ namespace Npgsql
 
                 if (_prepared == PrepareStatus.NotPrepared)
                 {
-                    byte[] commandText = GetCommandText();
-
-                    var query = new NpgsqlQuery(commandText);
+                    var commandText = GetCommandText();
 
                     // Write the Query message to the wire.
-                    _connector.Query(query);
+                    _connector.SendQuery(commandText);
 
                     // Tell to mediator what command is being sent.
                     if (_prepared == PrepareStatus.NotPrepared)
@@ -1404,16 +1642,13 @@ namespace Npgsql
                         _connector.Mediator.SetSqlSent(_preparedCommandText, NpgsqlMediator.SQLSentType.Execute);
                     }
 
-                    // Flush and wait for responses.
-                    responseEnum = _connector.ProcessBackendResponsesEnum();
+                    reader = new NpgsqlDataReader(this, cb, _connector.BlockNotificationThread());
 
-                    // Construct the return reader.
-                    reader = new NpgsqlDataReader(
-                        responseEnum,
-                        cb,
-                        this,
-                        _connector.BlockNotificationThread()
-                    );
+                    // For un-prepared statements, the first response is always a row description.
+                    // For prepared statements, we may be recycling a row description from a previous Execute.
+                    // TODO: This is the source of the inconsistency described in #357
+                    reader.NextResult();
+                    reader.UpdateOutputParameters();
 
                     if (
                         CommandType == CommandType.StoredProcedure
@@ -1427,7 +1662,7 @@ namespace Npgsql
 
                         while (reader.Read())
                         {
-                            sw.WriteLine("FETCH ALL FROM \"{0}\";", reader.GetString(0));
+                            sw.WriteLine(String.Format("FETCH ALL FROM \"{0}\";", reader.GetString(0)));
                         }
 
                         reader.Dispose();
@@ -1442,100 +1677,37 @@ namespace Npgsql
                         // Passthrough the commandtimeout to the inner command, so user can also control its timeout.
                         // TODO: Check if there is a better way to handle that.
 
-                        query = new NpgsqlQuery(queryText);
-
-                        // Write the Query message to the wire.
-                        _connector.Query(query);
-
-                        // Flush and wait for responses.
-                        responseEnum = _connector.ProcessBackendResponsesEnum();
-
-                        // Construct the return reader.
-                        reader = new NpgsqlDataReader(
-                            responseEnum,
-                            cb,
-                            this,
-                            _connector.BlockNotificationThread()
-                        );
+                        _connector.SendQuery(queryText);
+                        reader = new NpgsqlDataReader(this, cb, _connector.BlockNotificationThread());
+                        // For un-prepared statements, the first response is always a row description.
+                        // For prepared statements, we may be recycling a row description from a previous Execute.
+                        // TODO: This is the source of the inconsistency described in #357
+                        reader.NextResultInternal();
+                        reader.UpdateOutputParameters();
                     }
                 }
                 else
                 {
-                    // Update the Bind object with current parameter data as needed.
-                    BindParameters();
+                    // Bind the parameters, execute and sync
+                    for (var i = 0; i < _parameters.Count; i++)
+                        _parameters[i].Bind(_connector.NativeToBackendTypeConverterOptions);
+                    _connector.SendBind(AnonymousPortal, _planName, _parameters, _resultFormatCodes);
 
-                    // Write the Bind, Execute, and Sync message to the wire.
-                    _connector.Bind(_bind);
-                    _connector.Execute(_execute);
-                    _connector.Sync();
+                    _connector.SendExecute();
+                    _connector.SendSync();
 
                     // Tell to mediator what command is being sent.
                     _connector.Mediator.SetSqlSent(_preparedCommandText, NpgsqlMediator.SQLSentType.Execute);
 
-                    // Flush and wait for responses.
-                    responseEnum = _connector.ProcessBackendResponsesEnum();
-
                     // Construct the return reader, possibly with a saved row description from Prepare().
-                    reader = new NpgsqlDataReader(
-                        responseEnum,
-                        cb,
-                        this,
-                        _connector.BlockNotificationThread(),
-                        true,
-                        _currentRowDescription
-                    );
+                    reader = new NpgsqlDataReader(this, cb, _connector.BlockNotificationThread(), true, _currentRowDescription);
+                    if (_currentRowDescription == null) {
+                        reader.NextResultInternal();
+                    }
+                    reader.UpdateOutputParameters();
                 }
 
                 return reader;
-            }
-        }
-
-        ///<summary>
-        /// This method binds the parameters from parameters collection to the bind
-        /// message.
-        /// </summary>
-        void BindParameters()
-        {
-            if (_parameters.Count != 0)
-            {
-                var parameterValues = _bind.ParameterValues;
-                var parameterFormatCodes = _bind.ParameterFormatCodes;
-                var bindAll = false;
-                var bound = false;
-
-                if (parameterValues == null || parameterValues.Length != _parameters.Count)
-                {
-                    parameterValues = new byte[_parameters.Count][];
-                    bindAll = true;
-                }
-
-                for (var i = 0; i < _parameters.Count; i++)
-                {
-                    if (!bindAll && _parameters[i].Bound)
-                    {
-                        continue;
-                    }
-
-                    parameterValues[i] = _parameters[i].TypeInfo.ConvertToBackend(_parameters[i].Value, true, Connector.NativeToBackendTypeConverterOptions);
-
-                    bound = true;
-                    _parameters[i].Bound = true;
-
-                    if (parameterValues[i] == null)
-                    {
-                        parameterFormatCodes[i] = (short)FormatCode.Binary;
-                    }
-                    else
-                    {
-                        parameterFormatCodes[i] = _parameters[i].TypeInfo.SupportsBinaryBackendData ? (Int16)FormatCode.Binary : (Int16)FormatCode.Text;
-                    }
-                }
-
-                if (bound)
-                {
-                    _bind.ParameterValues = parameterValues;
-                    _bind.ParameterFormatCodes = parameterFormatCodes;
-                }
             }
         }
 
@@ -1588,6 +1760,11 @@ namespace Npgsql
         /// <remarks>As per the specs, no exception will be thrown by this method in case of failure</remarks>
         public override void Cancel()
         {
+            if (State != CommandState.InProgress) {
+                _log.DebugFormat("Skipping cancel because command is in state {0}", State);
+                return;
+            }
+
             _log.Debug("Cancelling command");
             try
             {
@@ -1617,7 +1794,7 @@ namespace Npgsql
         /// </summary>
         protected override void Dispose(bool disposing)
         {
-            if (_disposed)
+            if (State == CommandState.Disposed)
                 return;
 
             if (disposing)
@@ -1631,8 +1808,9 @@ namespace Npgsql
                 if (_prepared == PrepareStatus.Prepared)
                     _connector.ExecuteBlind("DEALLOCATE " + _planName);
             }
-
-            _disposed = true;
+            Transaction = null;
+            Connection = null;
+            State = CommandState.Disposed;
             base.Dispose(disposing);
         }
 
@@ -1654,20 +1832,20 @@ namespace Npgsql
 
             switch (Connector.State)
             {
-                case NpgsqlState.Ready:
+                case ConnectorState.Ready:
                     return;
-                case NpgsqlState.Closed:
-                case NpgsqlState.Broken:
-                case NpgsqlState.Connecting:
+                case ConnectorState.Closed:
+                case ConnectorState.Broken:
+                case ConnectorState.Connecting:
                     throw new InvalidOperationException(L10N.ConnectionNotOpen);
-                case NpgsqlState.Executing:
-                case NpgsqlState.Fetching:
+                case ConnectorState.Executing:
+                case ConnectorState.Fetching:
                     throw new InvalidOperationException("There is already an open DataReader associated with this Command which must be closed first.");
-                case NpgsqlState.CopyIn:
-                case NpgsqlState.CopyOut:
+                case ConnectorState.CopyIn:
+                case ConnectorState.CopyOut:
                     throw new InvalidOperationException("A COPY operation is in progress and must complete first.");
                 default:
-                    throw new ArgumentOutOfRangeException("Unknown state: " + Connector.State);
+                    throw new ArgumentOutOfRangeException("Connector.State", "Unknown state: " + Connector.State);
             }
         }
 
@@ -1718,21 +1896,6 @@ namespace Npgsql
             return clone;
         }
 
-        void SetCommandTimeout()
-        {
-            if (_commandTimeoutSet)
-                return;
-
-            if (Connection != null)
-            {
-                _timeout = Connection.CommandTimeout;
-            }
-            else
-            {
-                _timeout = (int)NpgsqlConnectionStringBuilder.GetDefaultValue(Keywords.CommandTimeout);
-            }
-        }
-
         enum PrepareStatus
         {
             NotPrepared,
@@ -1741,5 +1904,12 @@ namespace Npgsql
         }
 
         #endregion Misc
+    }
+
+    enum CommandState
+    {
+        Idle,
+        InProgress,
+        Disposed
     }
 }

@@ -182,7 +182,8 @@ namespace Npgsql
 
             if (SyncNotification)
             {
-                Connector.AddNotificationThread();
+                // Disable async notifications for now
+                //Connector.AddNotificationThread();
             }
 
             if (Enlist)
@@ -481,24 +482,24 @@ namespace Npgsql
 
                 switch (Connector.State)
                 {
-                    case NpgsqlState.Closed:
+                    case ConnectorState.Closed:
                         return ConnectionState.Closed;
-                    case NpgsqlState.Connecting:
+                    case ConnectorState.Connecting:
                         return ConnectionState.Connecting;
-                    case NpgsqlState.Ready:
+                    case ConnectorState.Ready:
                         return ConnectionState.Open;
-                    case NpgsqlState.Executing:
+                    case ConnectorState.Executing:
                         return ConnectionState.Open | ConnectionState.Executing;
-                    case NpgsqlState.Fetching:
+                    case ConnectorState.Fetching:
                         return ConnectionState.Open | ConnectionState.Fetching;
-                    case NpgsqlState.Broken:
+                    case ConnectorState.Broken:
                         return ConnectionState.Broken;
-                    case NpgsqlState.CopyIn:
+                    case ConnectorState.CopyIn:
                         return ConnectionState.Open | ConnectionState.Fetching;
-                    case NpgsqlState.CopyOut:
+                    case ConnectorState.CopyOut:
                         return ConnectionState.Closed | ConnectionState.Fetching;
                     default:
-                        throw new ArgumentOutOfRangeException("Unknown connector state: " + Connector.State);
+                        throw new ArgumentOutOfRangeException("Connector.State", "Unknown connector state: " + Connector.State);
                 }
             }
         }
@@ -663,7 +664,8 @@ namespace Npgsql
 
             if (SyncNotification)
             {
-                Connector.RemoveNotificationThread();
+                // Disable async notifications for now
+                //Connector.RemoveNotificationThread();
             }
 
             if (Pooling)

@@ -1319,15 +1319,16 @@ namespace NpgsqlTests
         }
 
         [Test]
-        public void Bug1010992DoubleValueSupport()
+        public void DoubleWithoutPrepared()
         {
             var command = new NpgsqlCommand("select :field_float8", Conn);
             command.Parameters.Add(new NpgsqlParameter(":field_float8", NpgsqlDbType.Double));
-            double x = 1d/7d;
-            //double value = 0.12345678901234561D;
+            double x = 1d/7d;;
             command.Parameters[0].Value = x;
             var valueReturned = command.ExecuteScalar();
-            Assert.AreEqual(x, valueReturned);
+            Assert.That(valueReturned, Is.EqualTo(x).Within(100).Ulps);
+            Console.WriteLine("Actual=  {0}", valueReturned);
+            Console.WriteLine("Expected={0}", x);
         }
 
         [Test]
@@ -2410,6 +2411,7 @@ namespace NpgsqlTests
         }
 
         [Test]
+        [Ignore]
         public void ParameterExplicitType2()
         {
             using (var command = new NpgsqlCommand(@"SELECT * FROM data WHERE field_date=:param", Conn))
@@ -3006,9 +3008,7 @@ namespace NpgsqlTests
                     cmd.Prepare();
 
                 var retVal = (float[])cmd.ExecuteScalar();
-                Assert.AreEqual(inVal.Length, retVal.Length);
-                Assert.AreEqual(inVal[0], retVal[0]);
-                Assert.AreEqual(inVal[1], retVal[1]);
+                Assert.That(retVal, Is.EqualTo(inVal).Within(100).Ulps);
             }
         }
 
@@ -3413,7 +3413,8 @@ namespace NpgsqlTests
                 paramBLOB.ParameterName = "BLOB";
                 cmd.Parameters.Add(paramBLOB);
                 cmd.Parameters[0].Value = DBNull.Value;
-                Assert.AreEqual(DbType.String, cmd.Parameters[0].DbType);
+                Assert.AreEqual(DbType.Object, cmd.Parameters[0].DbType);
+                Assert.AreEqual(NpgsqlDbType.Unknown, cmd.Parameters[0].NpgsqlDbType);
 
                 cmd.Parameters[0].Value = new byte[] {1, 2, 3};
                 Assert.AreEqual(DbType.Binary, cmd.Parameters[0].DbType);
@@ -3980,6 +3981,136 @@ namespace NpgsqlTests
         }
 
         [Test]
+        public void InputAndOutputParameters([Values(true, false)] bool prepareCommand)
+        {
+            using (var cmd = Conn.CreateCommand())
+            {
+                cmd.CommandText = "Select :a + 2 as b, :c - 1 as c";
+                var b = new NpgsqlParameter() { ParameterName = "b", Direction = ParameterDirection.Output };
+                cmd.Parameters.Add(b);
+                cmd.Parameters.Add(new NpgsqlParameter("a", 3));
+                var c = new NpgsqlParameter() { ParameterName = "c", Direction = ParameterDirection.InputOutput, Value = 4 };
+                cmd.Parameters.Add(c);
+                if (prepareCommand)
+                    cmd.Prepare();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    reader.Read();
+                    Assert.AreEqual(5, b.Value);
+                    Assert.AreEqual(3, c.Value);
+                }
+            }
+        }
+
+        [Test]
+        public void BitString([Values(true, false)] bool prepareCommand)
+        {
+            using (var cmd = Conn.CreateCommand())
+            {
+                cmd.CommandText = "Select :bs1 as output, :bs2, :bs3, :bs4, :bs5, array [1::bit, 0::bit], array [bit '10', bit '01'], :ba1, :ba2, :ba3";
+                var output = new NpgsqlParameter() { ParameterName = "output", Direction = ParameterDirection.Output };
+                cmd.Parameters.Add(output);
+                cmd.Parameters.Add(new NpgsqlParameter("bs1", NpgsqlDbType.Bit) { Value = new BitString("1011") });
+                cmd.Parameters.Add(new NpgsqlParameter("bs2", NpgsqlDbType.Bit, 1) { Value = true });
+                cmd.Parameters.Add(new NpgsqlParameter("bs3", NpgsqlDbType.Bit, 1) { Value = false });
+                cmd.Parameters.Add(new NpgsqlParameter("bs4", NpgsqlDbType.Bit, 2) { Value = new BitString("01") });
+                cmd.Parameters.Add(new NpgsqlParameter("bs5", NpgsqlDbType.Varbit) { Value = new BitString("01") });
+                cmd.Parameters.Add(new NpgsqlParameter("ba1", NpgsqlDbType.Varbit | NpgsqlDbType.Array) { Value = new BitString[] { new BitString("10"), new BitString("01") } });
+                cmd.Parameters.Add(new NpgsqlParameter("ba2", NpgsqlDbType.Bit | NpgsqlDbType.Array, 1) { Value = new bool[] { true, false } });
+                cmd.Parameters.Add(new NpgsqlParameter("ba3", NpgsqlDbType.Bit | NpgsqlDbType.Array, 1) { Value = new BitString[] { new BitString("1"), new BitString("0") } });
+                if (prepareCommand)
+                    cmd.Prepare();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    reader.Read();
+                    Assert.IsTrue(new BitString("1011") == (BitString)output.Value);
+                    Assert.IsTrue(new BitString("1011") == (BitString)reader.GetValue(0));
+                    Assert.AreEqual(true, reader.GetValue(1));
+                    Assert.AreEqual(false, reader.GetValue(2));
+                    Assert.IsTrue(new BitString("01") == (BitString)reader.GetValue(3));
+                    Assert.IsTrue(new BitString("01") == (BitString)reader.GetValue(4));
+                    Assert.AreEqual(true, ((bool[])reader.GetValue(5))[0]);
+                    Assert.AreEqual(false, ((bool[])reader.GetValue(5))[1]);
+                    for (int i = 6; i <= 7; i++)
+                    {
+                        Assert.AreEqual(new BitString("10"), ((BitString[])reader.GetValue(i))[0]);
+                        Assert.AreEqual(new BitString("01"), ((BitString[])reader.GetValue(i))[1]);
+                    }
+                    for (int i = 8; i <= 9; i++)
+                    {
+                        Assert.AreEqual(true, ((bool[])reader.GetValue(i))[0]);
+                        Assert.AreEqual(false, ((bool[])reader.GetValue(i))[1]);
+                    }
+                }
+            }
+        }
+
+        [Test]
+        public void SingleChar([Values(true, false)] bool prepareCommand)
+        {
+            using (var cmd = Conn.CreateCommand())
+            {
+                var testArr = new byte[] { prepareCommand ? (byte)200 : (byte)'}', prepareCommand ? (byte)0 : (byte)'"', 3 };
+                var testArr2 = new char[] { prepareCommand ? (char)200 : '}', prepareCommand ? (char)0 : '"', (char)3 };
+
+                cmd.CommandText = "Select 'a'::\"char\", (-3)::\"char\", :p1, :p2, :p3, :p4, :p5, :p6, :p7, :p8";
+                cmd.Parameters.Add(new NpgsqlParameter("p1", NpgsqlDbType.SingleChar) { Value = 'b' });
+                cmd.Parameters.Add(new NpgsqlParameter("p2", NpgsqlDbType.SingleChar) { Value = 66 });
+                cmd.Parameters.Add(new NpgsqlParameter("p3", NpgsqlDbType.SingleChar) { Value = "" });
+                cmd.Parameters.Add(new NpgsqlParameter("p4", NpgsqlDbType.SingleChar) { Value = "\0" });
+                cmd.Parameters.Add(new NpgsqlParameter("p5", NpgsqlDbType.SingleChar) { Value = "a" });
+                cmd.Parameters.Add(new NpgsqlParameter("p6", NpgsqlDbType.SingleChar) { Value = (byte)231 });
+                cmd.Parameters.Add(new NpgsqlParameter("p7", NpgsqlDbType.SingleChar | NpgsqlDbType.Array) { Value = testArr });
+                cmd.Parameters.Add(new NpgsqlParameter("p8", NpgsqlDbType.SingleChar | NpgsqlDbType.Array) { Value = testArr2 });
+                if (prepareCommand)
+                    cmd.Prepare();
+                using (var reader = cmd.ExecuteReader())
+                {
+                    reader.Read();
+                    var expected = new char[] { 'a', (char)(256-3), 'b', (char)66, '\0', '\0', 'a', (char)231 };
+                    for (int i = 0; i < expected.Length; i++)
+                    {
+                        Assert.AreEqual(expected[i], reader.GetChar(i));
+                    }
+                    var arr = (char[])reader.GetValue(8);
+                    var arr2 = (char[])reader.GetValue(9);
+                    Assert.AreEqual(testArr.Length, arr.Length);
+                    for (int i = 0; i < arr.Length; i++)
+                    {
+                        Assert.AreEqual(testArr[i], arr[i]);
+                        Assert.AreEqual(testArr2[i], arr2[i]);
+                    }
+                }
+            }
+        }
+
+        [Test]
+        public void Unknown([Values(true, false)] bool prepareCommand)
+        {
+            using (var cmd = Conn.CreateCommand())
+            {
+                cmd.CommandText = "Select :p1::timestamp, :p2::timestamp, :p3::int4";
+                cmd.Parameters.Add(new NpgsqlParameter("p1", NpgsqlDbType.Unknown) { Value = "2008-1-1" });
+                cmd.Parameters.Add(new NpgsqlParameter { ParameterName = "p2", Value = null });
+                cmd.Parameters.Add(new NpgsqlParameter { ParameterName = "p3", Value = "3" });
+                if (prepareCommand)
+                {
+                    cmd.Prepare();
+
+                    Assert.AreEqual(NpgsqlDbType.Timestamp, cmd.Parameters[1].NpgsqlDbType); // Should be inferred by context
+                    Assert.AreEqual(NpgsqlDbType.Text, cmd.Parameters[2].NpgsqlDbType); // Is inferred from the parametert value and not context
+                }
+                cmd.Parameters[1].Value = new DateTime(2008, 1, 1);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    reader.Read();
+                    Assert.AreEqual(new DateTime(2008, 1, 1), reader.GetValue(0));
+                    Assert.AreEqual(new DateTime(2008, 1, 1), reader.GetValue(1));
+                }
+            }
+        }
+
+        [Test]
         public void TestEmptyIEnumerableAsArray()
         {
             using (var command = new NpgsqlCommand("SELECT :array", Conn))
@@ -3999,7 +4130,7 @@ namespace NpgsqlTests
         {
             using (var cmd = new NpgsqlCommand("SELECT pg_sleep(5)", Conn))
             {
-                var cancelTask = Task.Factory.StartNew(() =>
+                Task.Factory.StartNew(() =>
                 {
                     Thread.Sleep(300);
                     cmd.Cancel();
@@ -4008,7 +4139,108 @@ namespace NpgsqlTests
                     Throws.TypeOf<NpgsqlException>()
                     .With.Property("Code").EqualTo("57014")
                 );
+            }
+        }
+
+        [Test, Description("Check that cancel only affects the command on which its was invoked")]
+        [Timeout(3000)]
+        public void CancelCrossCommand()
+        {
+            using (var cmd1 = new NpgsqlCommand("SELECT pg_sleep(2)", Conn))
+            using (var cmd2 = new NpgsqlCommand("SELECT 1", Conn))
+            {
+                var cancelTask = Task.Factory.StartNew(() =>
+                {
+                    Thread.Sleep(300);
+                    cmd2.Cancel();
+                });
+                Assert.That(() => cmd1.ExecuteNonQuery(), Throws.Nothing);
                 cancelTask.Wait();
+            }
+        }
+
+        [Test]
+        [IssueLink("https://github.com/npgsql/npgsql/issues/393")]
+        [IssueLink("https://github.com/npgsql/npgsql/issues/299")]
+        public void DisposePreparedAfterCommandClose()
+        {
+            using (var c = new NpgsqlConnection(ConnectionString))
+            {
+                using (var cmd = c.CreateCommand())
+                {
+                    c.Open();
+                    cmd.CommandText = "select 1";
+                    cmd.Prepare();
+                    c.Close();
+                }
+            }
+        }
+
+        [Test]
+        [IssueLink("https://github.com/npgsql/npgsql/issues/395")]
+        public void PreparedAcrossCloseOpen()
+        {
+            using (var c = new NpgsqlConnection(ConnectionString))
+            {
+                using (var cmd = c.CreateCommand())
+                {
+                    c.Open();
+                    cmd.CommandText = "SELECT 1";
+                    cmd.Prepare();
+                    Assert.That(cmd.IsPrepared, Is.True);
+                    c.Close();
+                    c.Open();
+                    Assert.That(cmd.IsPrepared, Is.False);
+                    cmd.Prepare();
+                    Assert.That(cmd.ExecuteScalar(), Is.EqualTo(1));
+                }
+            }
+        }
+
+        [Test]
+        [IssueLink("https://github.com/npgsql/npgsql/issues/395")]
+        public void UseAcrossConnectionChange([Values(PrepareOrNot.Prepared, PrepareOrNot.NotPrepared)] PrepareOrNot prepare)
+        {
+            using (var c = new NpgsqlConnection(ConnectionString))
+            {
+                using (var cmd = c.CreateCommand())
+                {
+                    c.Open();
+                    cmd.CommandText = "SELECT 1";
+                    if (prepare == PrepareOrNot.Prepared)
+                        cmd.Prepare();
+                    cmd.Connection = Conn;
+                    Assert.That(cmd.IsPrepared, Is.False);
+                    if (prepare == PrepareOrNot.Prepared)
+                        cmd.Prepare();
+                    Assert.That(cmd.ExecuteScalar(), Is.EqualTo(1));
+                }
+            }
+        }
+
+        [Test]
+        [IssueLink("https://github.com/npgsql/npgsql/issues/395")]
+        public void DefaultCommandTimeout()
+        {
+            if (Conn.Connector.DefaultCommandTimeout >= 100 && Conn.Connector.DefaultCommandTimeout < 105)
+                TestUtil.Inconclusive("Bad default command timeout");
+            using (var c1 = new NpgsqlConnection(ConnectionString + ";CommandTimeout=100"))
+            {
+                using (var cmd = c1.CreateCommand())
+                {
+                    Assert.That(cmd.CommandTimeout, Is.EqualTo(100));
+                    using (var c2 = new NpgsqlConnection(ConnectionString + ";CommandTimeout=101"))
+                    {
+                        cmd.Connection = c2;
+                        Assert.That(cmd.CommandTimeout, Is.EqualTo(101));
+                    }
+                    cmd.CommandTimeout = 102;
+                    using (var c2 = new NpgsqlConnection(ConnectionString + ";CommandTimeout=101"))
+                    {
+                        cmd.Connection = c2;
+                        Assert.That(cmd.CommandTimeout, Is.EqualTo(102));
+                    }
+                }
             }
         }
     }

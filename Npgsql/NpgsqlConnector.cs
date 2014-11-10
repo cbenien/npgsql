@@ -24,6 +24,7 @@ using System.Collections.Generic;
 using System.Data;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -48,7 +49,7 @@ namespace Npgsql
     /// access the physical connection to the database, and isolate
     /// the application developer from connection pooling internals.
     /// </summary>
-    internal class NpgsqlConnector
+    internal partial class NpgsqlConnector
     {
         readonly NpgsqlConnectionStringBuilder _settings;
 
@@ -69,6 +70,12 @@ namespace Npgsql
         internal BufferedStream Stream { get; set; }
 
         /// <summary>
+        /// Buffer used for reading data.
+        /// </summary>
+        // TODO: Work out the strategy for the size!
+        internal byte[] _buffer = new byte[1024 * 16];
+
+        /// <summary>
         /// The connection mediator.
         /// </summary>
         internal NpgsqlMediator Mediator { get; private set; }
@@ -84,11 +91,6 @@ namespace Npgsql
         /// Report if the connection is in a transaction.
         /// </summary>
         internal NpgsqlTransaction Transaction { get; set; }
-
-        /// <summary>
-        /// Reports if this connector is fully connected.
-        /// </summary>
-        internal bool IsInitialized { get; set; }
 
         internal bool Pooled { get; private set; }
 
@@ -120,6 +122,8 @@ namespace Npgsql
 
         internal SSPIHandler SSPI { get; set; }
 
+        List<NpgsqlError> _pendingErrors = new List<NpgsqlError>();
+
         static readonly ILog _log = LogManager.GetCurrentClassLogger();
 
         public NpgsqlConnector(NpgsqlConnection connection)
@@ -133,10 +137,9 @@ namespace Npgsql
         /// <param name="pooled">Pooled</param>
         public NpgsqlConnector(NpgsqlConnectionStringBuilder connectionString, bool pooled)
         {
-            State = NpgsqlState.Closed;
+            State = ConnectorState.Closed;
             _settings = connectionString;
             Pooled = pooled;
-            IsInitialized = false;
             Mediator = new NpgsqlMediator();
             NativeToBackendTypeConverterOptions = NativeToBackendTypeConverterOptions.Default.Clone(new NpgsqlBackendTypeMapping());
             _planIndex = 0;
@@ -176,15 +179,35 @@ namespace Npgsql
         /// <summary>
         /// Gets the current state of the connector
         /// </summary>
-        internal NpgsqlState State
+        internal ConnectorState State
         {
-            get { return (NpgsqlState)_state; }
+            get { return (ConnectorState)_state; }
             set
             {
                 var newState = (int) value;
                 if (newState == _state)
                     return;
                 Interlocked.Exchange(ref _state, newState);
+
+                switch (value)
+                {
+                    case ConnectorState.Closed:
+                    case ConnectorState.Ready:
+                    case ConnectorState.Broken:
+                        if (CurrentReader != null) {
+                            CurrentReader.Command.State = CommandState.Idle;
+                            CurrentReader = null;
+                        }
+                        break;
+                    case ConnectorState.Connecting:
+                    case ConnectorState.Executing:
+                    case ConnectorState.Fetching:
+                    case ConnectorState.CopyIn:
+                    case ConnectorState.CopyOut:
+                        break;
+                    default:
+                        throw new ArgumentOutOfRangeException("value");
+                }
             }
         }
 
@@ -197,18 +220,18 @@ namespace Npgsql
             {
                 switch (State)
                 {
-                    case NpgsqlState.Ready:
-                    case NpgsqlState.Executing:
-                    case NpgsqlState.Fetching:
-                    case NpgsqlState.CopyIn:
-                    case NpgsqlState.CopyOut:
+                    case ConnectorState.Ready:
+                    case ConnectorState.Executing:
+                    case ConnectorState.Fetching:
+                    case ConnectorState.CopyIn:
+                    case ConnectorState.CopyOut:
                         return true;
-                    case NpgsqlState.Closed:
-                    case NpgsqlState.Connecting:
-                    case NpgsqlState.Broken:
+                    case ConnectorState.Closed:
+                    case ConnectorState.Connecting:
+                    case ConnectorState.Broken:
                         return false;
                     default:
-                        throw new ArgumentOutOfRangeException("Unknown state: " + State);
+                        throw new ArgumentOutOfRangeException("State", "Unknown state: " + State);
                 }
             }
         }
@@ -222,18 +245,18 @@ namespace Npgsql
             {
                 switch (State)
                 {
-                    case NpgsqlState.Executing:
-                    case NpgsqlState.Fetching:
-                    case NpgsqlState.CopyIn:
-                    case NpgsqlState.CopyOut:
+                    case ConnectorState.Executing:
+                    case ConnectorState.Fetching:
+                    case ConnectorState.CopyIn:
+                    case ConnectorState.CopyOut:
                         return true;
-                    case NpgsqlState.Ready:
-                    case NpgsqlState.Closed:
-                    case NpgsqlState.Connecting:
-                    case NpgsqlState.Broken:
+                    case ConnectorState.Ready:
+                    case ConnectorState.Closed:
+                    case ConnectorState.Connecting:
+                    case ConnectorState.Broken:
                         return false;
                     default:
-                        throw new ArgumentOutOfRangeException("Unknown state: " + State);
+                        throw new ArgumentOutOfRangeException("State", "Unknown state: " + State);
                 }
             }
         }
@@ -249,11 +272,11 @@ namespace Npgsql
         /// Method of the connection pool manager.</remarks>
         internal void Open()
         {
-            if (State != NpgsqlState.Closed) {
+            if (State != ConnectorState.Closed) {
                 throw new InvalidOperationException("Can't open, state is " + State);
             }
 
-            State = NpgsqlState.Connecting;
+            State = ConnectorState.Connecting;
 
             ServerVersion = null;
 
@@ -266,9 +289,10 @@ namespace Npgsql
             try
             {
                 // Establish protocol communication and handle authentication...
-                var startupPacket = new NpgsqlStartupPacket(Database, UserName, _settings);
-                startupPacket.WriteToStream(Stream);
-                ProcessAndDiscardBackendResponses();
+                //var startupPacket = new NpgsqlStartupPacket(Database, UserName, _settings);
+                //startupPacket.WriteToStream(Stream);
+                SendStartup(Database, UserName, _settings);
+                ConsumeAll();
             }
             catch
             {
@@ -282,9 +306,6 @@ namespace Npgsql
 
                 throw;
             }
-
-            // Change the state of connection to open and ready.
-            State = NpgsqlState.Ready;
 
             // After attachment, the stream will close the connector (this) when the stream gets disposed.
             BaseStream.AttachConnector(this);
@@ -307,7 +328,6 @@ namespace Npgsql
 
             // Some connection parameters for protocol 3 had been sent in the startup packet.
             // The rest will be setted here.
-            sbInitQueries.WriteLine("SET extra_float_digits=3;");
             sbInitQueries.WriteLine("SET ssl_renegotiation_limit=0;");
 
             _initQueries = sbInitQueries.ToString();
@@ -320,9 +340,7 @@ namespace Npgsql
             // if connected to the same backend version.
             NativeToBackendTypeConverterOptions.OidToNameMapping = NpgsqlTypesHelper.CreateAndLoadInitialTypesMapping(this).Clone();
 
-            // The connector is now fully initialized. Beyond this point, it is
-            // safe to release it back to the pool rather than closing it.
-            IsInitialized = true;
+            State = ConnectorState.Ready;
         }
 
         public void RawOpen(int timeout)
@@ -445,118 +463,340 @@ namespace Npgsql
 
         #endregion
 
-        #region Outgoing messages
+        #region Startup
 
-        internal void Query(NpgsqlQuery query)
+        internal void SendStartup(string databaseName, String username, NpgsqlConnectionStringBuilder settings)
         {
-            if (_log.IsDebugEnabled)
-                _log.Debug("Sending query: " + query);
-            query.WriteToStream(Stream);
-            State = NpgsqlState.Executing;
+            var parameters = new Dictionary<String, String> {
+                { "database",           databaseName },
+                { "user",               username     },
+                { "DateStyle",          "ISO"        },
+                { "client_encoding",    "UTF8"       },
+                { "lc_monetary",        "C"          },
+            };
+
+            if (!string.IsNullOrEmpty(settings.ApplicationName)) {
+                parameters.Add("application_name", settings.ApplicationName);
+            }
+
+            if (!string.IsNullOrEmpty(settings.SearchPath)) {
+                parameters.Add("search_path", settings.SearchPath);
+            }
+
+            var encodedParams = parameters.ToDictionary(kv => BackendEncoding.UTF8Encoding.GetBytes(kv.Key),
+                                                        kv => BackendEncoding.UTF8Encoding.GetBytes(kv.Value));
+
+            var packetSize = 4 + 4 + 1 + encodedParams
+                .Select(kv => kv.Key.Length + kv.Value.Length + 2)
+                .Sum();
+
+            Stream
+                .WriteInt32(packetSize)
+                .WriteInt32(PGUtil.ConvertProtocolVersion(ProtocolVersion.Version3));
+
+            foreach (var kv in encodedParams)
+            {
+                Stream
+                    .WriteBytesNullTerminated(kv.Key)
+                    .WriteBytesNullTerminated(kv.Value);
+            }
+
+            Stream.WriteByte(ASCIIByteArrays.Byte_0).Flush();
         }
 
-        internal void Authenticate(byte[] password)
-        {
-            _log.Debug("Authenticating");
-            var pwpck = new NpgsqlPasswordPacket(password);
-            pwpck.WriteToStream(Stream);
-        }
+        #endregion Startup
 
-        internal void Parse(NpgsqlParse parse)
-        {
-            _log.Debug("Sending parse message");
-            parse.WriteToStream(Stream);
-        }
+        #region Bind
 
-        internal void Sync()
-        {
-            _log.Debug("Sending sync message");
-            NpgsqlSync.Default.WriteToStream(Stream);
-        }
-
-        internal void Bind(NpgsqlBind bind)
+        [GenerateAsync]
+        internal void SendBind(string portalName, string statementName, NpgsqlParameterCollection parameters, short[] resultFormatCodes)
         {
             _log.Debug("Sending bind message");
-            bind.WriteToStream(Stream);
-        }
 
-        internal void Describe(NpgsqlDescribe describe)
-        {
-            _log.Debug("Sending describe message");
-            describe.WriteToStream(Stream);
-        }
+            var portalNameBytes = BackendEncoding.UTF8Encoding.GetBytes(portalName);
+            var statementNameBytes = BackendEncoding.UTF8Encoding.GetBytes(statementName);
 
-        internal void Execute(NpgsqlExecute execute)
-        {
-            _log.Debug("Sending execute message");
-            execute.WriteToStream(Stream);
-        }
+            // When sending format codes, the list can be optimized if all format codes are the same.
+            // If all are text, we send an empty list.
+            // If all are binary, we send a list with length one, containing a 1 (indicates binary).
+            // Otherwise, we send the whole list.
 
-        #endregion Outgoing messages
-
-        #region Backend message processing
-
-        /// <summary>
-        /// Call ProcessBackendResponsesEnum(), and scan and discard all results.
-        /// </summary>
-        internal void ProcessAndDiscardBackendResponses()
-        {
-            // Flush and wait for responses.
-            var responseEnum = ProcessBackendResponsesEnum();
-
-            // Discard each response.
-            foreach (var response in responseEnum)
+            var len = 0;
+            var numInputParameters = 0;
+            var allSameFormatCode = -1;
+            for (var i = 0; i < parameters.Count; i++)
             {
-                if (response is IDisposable)
+                if (parameters[i].IsInputDirection)
                 {
-                    (response as IDisposable).Dispose();
+                    numInputParameters++;
+                    len += 4;
+                    if (parameters[i].BoundValue != null)
+                    {
+                        len += parameters[i].BoundValue.Length;
+                    }
+                    if (allSameFormatCode == -1)
+                    {
+                        allSameFormatCode = parameters[i].BoundFormatCode;
+                    }
+                    else if (allSameFormatCode != parameters[i].BoundFormatCode)
+                    {
+                        allSameFormatCode = -2;
+                    }
+                }
+            }
+
+            len +=
+                    4 + // Message length (32 bits)
+                    portalNameBytes.Length + 1 + // Portal name + null terminator
+                    statementNameBytes.Length + 1 + // Statement name + null terminator
+                    2 + // Parameter format code array length (16 bits)
+                    (allSameFormatCode >= 0 ? allSameFormatCode : numInputParameters) * 2 + // Parameter format code array (16 bits per code)
+                    2; // Parameter value array length (16 bits)
+
+            var allSameResultFormatCode = -1;
+            for (var i = 0; i < resultFormatCodes.Length; i++)
+            {
+                if (allSameResultFormatCode == -1)
+                {
+                    allSameResultFormatCode = resultFormatCodes[i];
+                }
+                else if (allSameResultFormatCode != resultFormatCodes[i])
+                {
+                    allSameResultFormatCode = -2;
+                }
+            }
+
+            len +=
+                    2 + // Result format code array length (16 bits)
+                    (allSameResultFormatCode >= 0 ? allSameResultFormatCode : resultFormatCodes.Length) * 2; // Result format code array (16 bits per code)
+
+            Stream
+                .WriteByte(ASCIIByteArrays.BindMessageCode)
+                .WriteInt32(len)
+                .WriteBytesNullTerminated(portalNameBytes)
+                .WriteBytesNullTerminated(statementNameBytes)
+                .WriteInt16((short)(allSameFormatCode >= 0 ? allSameFormatCode : numInputParameters));
+
+            if (parameters.Count > 0)
+            {
+                if (allSameFormatCode == 1)
+                {
+                    Stream.WriteInt16((short)FormatCode.Binary);
+                }
+                else if (allSameFormatCode == -2)
+                {
+                    for (var i = 0; i < parameters.Count; i++)
+                    {
+                        if (parameters[i].IsInputDirection)
+                        {
+                            Stream.WriteInt16(parameters[i].BoundFormatCode);
+                        }
+                    }
+                }
+
+                Stream.WriteInt16((short)numInputParameters);
+
+                for (var i = 0; i < parameters.Count; i++)
+                {
+                    if (parameters[i].IsInputDirection)
+                    {
+                        var value = parameters[i].BoundValue;
+                        if (value == null)
+                        {
+                            Stream.WriteInt32(-1);
+                        }
+                        else
+                        {
+                            Stream
+                                .WriteInt32(value.Length)
+                                .WriteBytes(value);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                Stream.WriteInt16(0); // Number of parameter values sent
+            }
+
+            Stream.WriteInt16((short)(allSameResultFormatCode >= 0 ? allSameResultFormatCode : resultFormatCodes.Length));
+
+            if (allSameResultFormatCode == 1)
+            {
+                Stream.WriteInt16((short)FormatCode.Binary);
+            }
+            else if (allSameResultFormatCode == -2)
+            {
+                foreach (var code in resultFormatCodes)
+                {
+                    Stream.WriteInt16(code);
                 }
             }
         }
 
-        ///<summary>
-        /// This method is responsible to handle all protocol messages sent from the backend.
-        /// It holds all the logic to do it.
-        /// To exchange data, it uses a Mediator object from which it reads/writes information
-        /// to handle backend requests.
+        #endregion
+
+        #region Query
+
+        [GenerateAsync]
+        internal void SendQuery(string query)
+        {
+            _log.Debug("Sending query");
+            QueryManager.WriteQuery(Stream, query);
+            Stream.Flush();
+            State = ConnectorState.Executing;
+        }
+
+        [GenerateAsync]
+        internal void SendQuery(byte[] query)
+        {
+            _log.Debug("Sending query");
+            QueryManager.WriteQuery(Stream, query);
+            Stream.Flush();
+            State = ConnectorState.Executing;
+        }
+
+        /// <summary>
+        /// Sends a raw query message to the backend. The message must already contain the message code,
+        /// length etc. - this methods simply writes it to the wire.
         /// </summary>
-        ///
-        internal IEnumerable<IServerResponseObject> ProcessBackendResponsesEnum()
+        /// <param name="rawQuery">a fully-built query message, ready to be sent</param>
+        [GenerateAsync]
+        internal void SendQueryRaw(byte[] rawQuery)
+        {
+            _log.Debug("Sending query");
+            Stream.Write(rawQuery, 0, rawQuery.Length);
+            Stream.Flush();
+            State = ConnectorState.Executing;
+        }
+
+        #endregion
+
+        #region Simple outgoing messages
+
+        [GenerateAsync]
+        internal void SendPasswordMessage(byte[] password)
+        {
+            _log.Debug("Sending authenticate message");
+
+            Stream
+                .WriteByte(ASCIIByteArrays.PasswordMessageCode)
+                .WriteInt32(4 + password.Length)
+                .WriteBytes(password)
+                .Flush();
+        }
+
+        [GenerateAsync]
+        internal void SendParse(string prepareName, byte[] queryString, int[] parameterIDs)
+        {
+            _log.Debug("Sending parse message");
+
+            var prepareNameBytes = BackendEncoding.UTF8Encoding.GetBytes(prepareName);
+            //Stream.Write(ASCIIByteArrays.ParseMessageCode, 0, 1);
+
+            // message length =
+            // Int32 self
+            // name of prepared statement + 1 null string terminator +
+            // query string + 1 null string terminator
+            // + Int16
+            // + Int32 * number of parameters.
+            var messageLength = 4 + prepareNameBytes.Length + 1 + queryString.Length + 1 +
+                                  2 + (parameterIDs.Length * 4);
+
+            Stream
+                .WriteByte(ASCIIByteArrays.ParseMessageCode)
+                .WriteInt32(messageLength)
+                .WriteBytesNullTerminated(prepareNameBytes)
+                .WriteBytesNullTerminated(queryString)
+                .WriteInt16((short)parameterIDs.Length);
+
+            for (var i = 0; i < parameterIDs.Length; i++) {
+                Stream.WriteInt32(parameterIDs[i]);
+            }
+
+            Stream.Flush();
+        }
+
+        [GenerateAsync]
+        internal void SendSync()
+        {
+            _log.Debug("Sending sync message");
+
+            Stream
+                .WriteByte(ASCIIByteArrays.SyncMessageCode)
+                .WriteInt32(4)
+                .Flush();
+        }
+
+        [GenerateAsync]
+        internal void SendDescribePortal(string portalName)
+        {
+            _log.Debug("Sending describe portal message");
+            var portalNameBytes = BackendEncoding.UTF8Encoding.GetBytes(portalName);
+            var len = 4 + 1 + portalNameBytes.Length + 1;
+            Stream
+                .WriteByte(ASCIIByteArrays.DescribeMessageCode)
+                .WriteInt32(len)
+                .WriteByte(ASCIIByteArrays.DescribePortalCode)
+                .WriteBytesNullTerminated(portalNameBytes)
+                .Flush();
+        }
+
+        [GenerateAsync]
+        internal void SendDescribeStatement(string statementName)
+        {
+            _log.Debug("Sending describe statement message");
+            var statementNameBytes = BackendEncoding.UTF8Encoding.GetBytes(statementName);
+            var len = 4 + 1 + statementNameBytes.Length + 1;
+            Stream
+                .WriteByte(ASCIIByteArrays.DescribeMessageCode)
+                .WriteInt32(len)
+                .WriteByte(ASCIIByteArrays.DescribeStatementCode)
+                .WriteBytesNullTerminated(statementNameBytes)
+                .Flush();
+        }
+
+        [GenerateAsync]
+        internal void SendExecute(string portalName="", int maxRows=0)
+        {
+            _log.Debug("Sending execute message");
+
+            var portalNameBytes = BackendEncoding.UTF8Encoding.GetBytes(portalName);
+            var len = 4 + portalNameBytes.Length + 1 + 4;
+            Stream
+                .WriteByte(ASCIIByteArrays.ExecuteMessageCode)
+                .WriteInt32(len)
+                .WriteBytesNullTerminated(portalNameBytes)
+                .WriteInt32(maxRows);
+        }
+
+        [GenerateAsync]
+        internal void SendFlush()
+        {
+            _log.Debug("Sending flush message");
+
+            Stream
+                .WriteByte(ASCIIByteArrays.FlushMessageCode)
+                .WriteInt32(4);
+        }
+
+        #endregion Simple outgoing messages
+
+        #region Backend message processing
+
+        [GenerateAsync]
+        internal IServerMessage ReadMessage()
         {
             try
             {
-                // Flush buffers to the wire.
-                Stream.Flush();
-
-                // Process commandTimeout behavior.
-
-                if ((Mediator.BackendCommandTimeout > 0) &&
-                        (!CheckForContextSocketAvailability(SelectMode.SelectRead)))
-                {
-                    // If timeout occurs when establishing the session with server then
-                    // throw an exception instead of trying to cancel query. This helps to prevent loop as
-                    // CancelRequest will also try to stablish a connection and sends commands.
-                    if (State != NpgsqlState.Connecting)
-                    {
-                        try
-                        {
-                            CancelRequest();
-                            ProcessAndDiscardBackendResponses();
-                        }
-                        catch (Exception)
-                        {
-                        }
-                        // We should have gotten an error from CancelRequest(). Whether we did or not, what we
-                        // really have is a timeout exception, and that will be less confusing to the user than
-                        // "operation cancelled by user" or similar, so whatever the case, that is what we'll throw.
-                        // Changed message again to report about the two possible timeouts: connection or command
-                        // as the establishment timeout only was confusing users when the timeout was a command timeout.
-                    }
-
-                    throw new TimeoutException(L10N.ConnectionOrCommandTimeout);
-                }
-
-                return ProcessBackendResponses();
+                return this.ReadMessageInternal();
+            }
+            catch (IOException e)
+            {
+                // TODO: Identify socket timeout? But what to do at this point? Seems
+                // impossible to actually recover the connection (sync the protocol), best just
+                // transition to Broken like any other IOException...
+                throw;
             }
             catch (ThreadAbortException)
             {
@@ -566,26 +806,24 @@ namespace Npgsql
                     Close();
                 }
                 catch { }
-
                 throw;
             }
         }
 
-        internal IEnumerable<IServerResponseObject> ProcessBackendResponses()
+        [GenerateAsync]
+        IServerMessage ReadMessageInternal()
         {
-            var errors = new List<NpgsqlError>();
-
             for (;;)
             {
                 // Check the first Byte of response.
-                var message = (BackEndMessageCode) Stream.ReadByte();
+                Stream.Read(_buffer, 0, 1);
+                var message = (BackEndMessageCode) _buffer[0];
                 switch (message)
                 {
                     case BackEndMessageCode.ErrorResponse:
                         var error = new NpgsqlError(Stream);
                         _log.Trace("Received backend error: " + error.Message);
                         error.ErrorSql = Mediator.GetSqlSent();
-                        errors.Add(error);
 
                         // We normally accumulate errors until the query ends (ReadyForQuery). But
                         // during the connection phase errors need to be thrown immediately
@@ -594,25 +832,27 @@ namespace Npgsql
                         // Possible error in the NpgsqlConnectedState:
                         //        No pg_hba.conf configured.
 
-                        if (State == NpgsqlState.Connecting) {
-                            throw new NpgsqlException(errors);
+                        if (State == ConnectorState.Connecting) {
+                            throw new NpgsqlException(error);
                         }
 
-                        break;
+                        _pendingErrors.Add(error);
+                        continue;
+
                     case BackEndMessageCode.AuthenticationRequest:
                         // Get the length in case we're getting AuthenticationGSSContinue
                         var authDataLength = Stream.ReadInt32() - 8;
 
-                        var authType = (AuthenticationRequestType) Stream.ReadInt32();
+                        var authType = (AuthenticationRequestType)Stream.ReadInt32();
                         _log.Trace("Received AuthenticationRequest of type " + authType);
                         switch (authType)
                         {
                             case AuthenticationRequestType.AuthenticationOk:
-                                break;
+                                continue;
                             case AuthenticationRequestType.AuthenticationClearTextPassword:
                                 // Send the PasswordPacket.
-                                Authenticate(PGUtil.NullTerminateArray(Password));
-                                break;
+                                SendPasswordMessage(PGUtil.NullTerminateArray(Password));
+                                continue;
                             case AuthenticationRequestType.AuthenticationMD5Password:
                                 // Now do the "MD5-Thing"
                                 // for this the Password has to be:
@@ -656,9 +896,8 @@ namespace Npgsql
                                     sb.Append(b.ToString("x2"));
                                 }
 
-                                Authenticate(PGUtil.NullTerminateArray(BackendEncoding.UTF8Encoding.GetBytes(sb.ToString())));
-
-                                break;
+                                SendPasswordMessage(PGUtil.NullTerminateArray(BackendEncoding.UTF8Encoding.GetBytes(sb.ToString())));
+                                continue;
 
                             case AuthenticationRequestType.AuthenticationGSS:
                             {
@@ -666,8 +905,8 @@ namespace Npgsql
                                 {
                                     // For GSSAPI we have to use the supplied hostname
                                     SSPI = new SSPIHandler(Host, "POSTGRES", true);
-                                    Authenticate(SSPI.Continue(null));
-                                    break;
+                                    SendPasswordMessage(SSPI.Continue(null));
+                                    continue;
                                 }
                                 else
                                 {
@@ -681,10 +920,10 @@ namespace Npgsql
                                 if (IntegratedSecurity)
                                 {
                                     // For SSPI we have to get the IP-Address (hostname doesn't work)
-                                    var ipAddressString = ((IPEndPoint) Socket.RemoteEndPoint).Address.ToString();
+                                    var ipAddressString = ((IPEndPoint)Socket.RemoteEndPoint).Address.ToString();
                                     SSPI = new SSPIHandler(ipAddressString, "POSTGRES", false);
-                                    Authenticate(SSPI.Continue(null));
-                                    break;
+                                    SendPasswordMessage(SSPI.Continue(null));
+                                    continue;
                                 }
                                 else
                                 {
@@ -700,37 +939,36 @@ namespace Npgsql
                                 var passwdRead = SSPI.Continue(authData);
                                 if (passwdRead.Length != 0)
                                 {
-                                    Authenticate(passwdRead);
+                                    SendPasswordMessage(passwdRead);
                                 }
-                                break;
+                                continue;
                             }
 
                             default:
-                            throw new NotSupportedException(String.Format(L10N.AuthenticationMethodNotSupported, authType));
+                                throw new NotSupportedException(String.Format(L10N.AuthenticationMethodNotSupported, authType));
                         }
-                        break;
+
                     case BackEndMessageCode.RowDescription:
                         _log.Trace("Received RowDescription");
-                        yield return new NpgsqlRowDescription(Stream, OidToNameMapping);
-                        break;
+                        return new NpgsqlRowDescription(Stream, OidToNameMapping);
 
                     case BackEndMessageCode.ParameterDescription:
                         _log.Trace("Received ParameterDescription");
-                        // Do nothing,for instance,  just read...
+                        // PostgreSQL has found out what parameter types we must use
+
                         Stream.ReadInt32();
                         var nbParam = Stream.ReadInt16();
+                        var typeoids = new int[nbParam];
                         for (var i = 0; i < nbParam; i++)
                         {
-                            Stream.ReadInt32();  // typeoids
+                            typeoids[i] = Stream.ReadInt32();  // typeoid
                         }
-
-                        break;
+                        return new ParameterDescriptionResponse(typeoids);
 
                     case BackEndMessageCode.DataRow:
                         _log.Trace("Received DataRow");
-                        State = NpgsqlState.Fetching;
-                        yield return new StringRowReader(Stream);
-                        break;
+                        State = ConnectorState.Fetching;
+                        return new StringRowReader(Stream);
 
                     case BackEndMessageCode.ReadyForQuery:
                         _log.Trace("Received ReadyForQuery");
@@ -743,61 +981,59 @@ namespace Npgsql
                         Stream.ReadInt32();
                         Stream.ReadByte();
 
-                        State = NpgsqlState.Ready;
+                        State = ConnectorState.Ready;
 
-                        if (errors.Count != 0)
-                        {
-                            throw new NpgsqlException(errors);
+                        if (_pendingErrors.Any()) {
+                            var e = new NpgsqlException(_pendingErrors);
+                            _pendingErrors.Clear();
+                            throw e;
                         }
-
-                        yield break;
+                        return ReadyForQueryMsg.Instance;
 
                     case BackEndMessageCode.BackendKeyData:
                         _log.Trace("Received BackendKeyData");
                         BackEndKeyData = new NpgsqlBackEndKeyData(Stream);
                         // Wait for ReadForQuery message
-                        break;
+                        continue;
 
                     case BackEndMessageCode.NoticeResponse:
                         _log.Trace("Received NoticeResponse");
                         // Notices and errors are identical except that we
                         // just throw notices away completely ignored.
                         FireNotice(new NpgsqlError(Stream));
-                        break;
+                        continue;
 
                     case BackEndMessageCode.CompletedResponse:
                         _log.Trace("Received CompletedResponse");
                         Stream.ReadInt32();
-                        yield return new CompletedResponse(Stream);
-                        break;
+                        return new CompletedResponse(Stream);
 
                     case BackEndMessageCode.ParseComplete:
                         _log.Trace("Received ParseComplete");
                         // Just read up the message length.
                         Stream.ReadInt32();
-                        break;
+                        continue;
 
                     case BackEndMessageCode.BindComplete:
                         _log.Trace("Received BindComplete");
                         // Just read up the message length.
                         Stream.ReadInt32();
-                        break;
+                        continue;
 
                     case BackEndMessageCode.EmptyQueryResponse:
                         _log.Trace("Received EmptyQueryResponse");
                         Stream.ReadInt32();
-                        break;
+                        continue;
 
                     case BackEndMessageCode.NotificationResponse:
                         _log.Trace("Received NotificationResponse");
                         // Eat the length
                         Stream.ReadInt32();
                         FireNotification(new NpgsqlNotificationEventArgs(Stream, true));
-                        if (IsNotificationThreadRunning)
-                        {
-                            yield break;
+                        if (IsNotificationThreadRunning) {
+                            throw new Exception("Internal state error, notification thread is running");
                         }
-                        break;
+                        continue;
 
                     case BackEndMessageCode.ParameterStatus:
                         var paramStatus = new NpgsqlParameterStatus(Stream);
@@ -821,7 +1057,7 @@ namespace Npgsql
                             }
                             ServerVersion = new Version(versionString);
                         }
-                        break;
+                        continue;
 
                     case BackEndMessageCode.NoData:
                         // This nodata message may be generated by prepare commands issued with queries which doesn't return rows
@@ -829,24 +1065,24 @@ namespace Npgsql
                         // Just eat the message.
                         _log.Trace("Received NoData");
                         Stream.ReadInt32();
-                        break;
+                        continue;
 
                     case BackEndMessageCode.CopyInResponse:
                         _log.Trace("Received CopyInResponse");
                         // Enter COPY sub protocol and start pushing data to server
-                        State = NpgsqlState.CopyIn;
+                        State = ConnectorState.CopyIn;
                         Stream.ReadInt32(); // length redundant
                         StartCopyIn(ReadCopyHeader());
-                        yield break;
+                        return CopyInResponseMsg.Instance;
                         // Either StartCopy called us again to finish the operation or control should be passed for user to feed copy data
 
                     case BackEndMessageCode.CopyOutResponse:
                         _log.Trace("Received CopyOutResponse");
                         // Enter COPY sub protocol and start pulling data from server
-                        State = NpgsqlState.CopyOut;
+                        State = ConnectorState.CopyOut;
                         Stream.ReadInt32(); // length redundant
                         StartCopyOut(ReadCopyHeader());
-                        yield break;
+                        return CopyOutResponseMsg.Instance;
                         // Either StartCopy called us again to finish the operation or control should be passed for user to feed copy data
 
                     case BackEndMessageCode.CopyData:
@@ -855,14 +1091,14 @@ namespace Npgsql
                         var buf = new byte[len];
                         Stream.ReadBytes(buf, 0, len);
                         Mediator.ReceivedCopyData = buf;
-                        yield break;
+                        return CopyDataMsg.Instance;
                         // read data from server one chunk at a time while staying in copy operation mode
 
                     case BackEndMessageCode.CopyDone:
                         _log.Trace("Received CopyDone");
                         Stream.ReadInt32(); // CopyDone can not have content so this is always 4
                         // This will be followed by normal CommandComplete + ReadyForQuery so no op needed
-                        break;
+                        continue;
 
                     case BackEndMessageCode.IO_ERROR:
                         // Connection broken. Mono returns -1 instead of throwing an exception as ms.net does.
@@ -875,50 +1111,28 @@ namespace Npgsql
                         //   Backend has gone insane?
                         // FIXME
                         // what exception should we really throw here?
-                        throw new NotSupportedException(String.Format(
-                            "Backend sent unrecognized response type: {0}", (Char) message));
+                        throw new NotSupportedException(String.Format("Backend sent unrecognized response type: {0}", (Char) message));
                 }
             }
         }
 
         /// <summary>
-        /// Checks for context socket availability.
-        /// Socket.Poll supports integer as microseconds parameter.
-        /// This limits the usable command timeout value
-        /// to 2,147 seconds: (2,147 x 1,000,000 less than  max_int).
-        /// In order to bypass this limit, the availability of
-        /// the socket is checked in 2,147 seconds cycles
+        /// Consumes and disposes all backend messages until the next ReadyForQuery
         /// </summary>
-        /// <returns><c>true</c>, if for context socket availability was checked, <c>false</c> otherwise.</returns>
-        /// <param name="selectMode">Select mode.</param>
-        internal bool CheckForContextSocketAvailability(SelectMode selectMode)
+        [GenerateAsync]
+        internal void ConsumeAll()
         {
-            /* Socket.Poll supports integer as microseconds parameter.
-             * This limits the usable command timeout value
-             * to 2,147 seconds: (2,147 x 1,000,000 < max_int).
-             */
-            const int limitOfSeconds = 2147;
-
-            var socketPoolResponse = false;
-
-            // Because the backend's statement_timeout parameter has been set to context.Mediator.BackendCommandTimeout,
-            // we will give an extra 5 seconds because we'd prefer to receive a timeout error from PG
-            // than to be forced to start a new connection and send a cancel request.
-            // The result is that a timeout could take 5 seconds too long to occur, but if everything
-            // is healthy, that shouldn't happen. Not to mention, if the backend is unhealthy enough
-            // to fail to send a timeout error, then a cancel request may malfunction anyway.
-            var secondsToWait = Mediator.BackendCommandTimeout + 5;
-
-            /* In order to bypass this limit, the availability of
-             * the socket is checked in 2,147 seconds cycles
-             */
-            while ((secondsToWait > limitOfSeconds) && (!socketPoolResponse))
+            while (true)
             {
-                socketPoolResponse = Socket.Poll(1000000 * limitOfSeconds, selectMode);
-                secondsToWait -= limitOfSeconds;
+                var msg = ReadMessage();
+                if (msg is ReadyForQueryMsg)
+                    return;
+                var asDisposable = msg as IDisposable;
+                if (asDisposable != null)
+                {
+                    asDisposable.Dispose();
+                }
             }
-
-            return socketPoolResponse || Socket.Poll(1000000 * secondsToWait, selectMode);
         }
 
         #endregion Backend message processing
@@ -984,7 +1198,7 @@ namespace Npgsql
         {
             Stream.WriteByte((byte)FrontEndMessageCode.CopyDone);
             Stream.WriteInt32(4); // message without data
-            ProcessAndDiscardBackendResponses();
+            ConsumeAll();
         }
 
         /// <summary>
@@ -999,7 +1213,7 @@ namespace Npgsql
             var buf = BackendEncoding.UTF8Encoding.GetBytes((message ?? string.Empty) + '\x00');
             Stream.WriteInt32(4 + buf.Length);
             Stream.Write(buf, 0, buf.Length);
-            ProcessAndDiscardBackendResponses();
+            ConsumeAll();
         }
 
         /// <summary>
@@ -1032,13 +1246,7 @@ namespace Npgsql
         internal byte[] GetCopyOutData()
         {
             // polling in COPY would take seconds on Windows
-            foreach (var obj in ProcessBackendResponses())
-            {
-                if (obj is IDisposable)
-                {
-                    (obj as IDisposable).Dispose();
-                }
-            }
+            ConsumeAll();
             return Mediator.ReceivedCopyData;
         }
 
@@ -1175,7 +1383,7 @@ namespace Npgsql
         /// </summary>
         internal void CancelRequest()
         {
-            var cancelConnector = new NpgsqlConnector(_settings, false) { BackEndKeyData = BackEndKeyData };
+            var cancelConnector = new NpgsqlConnector(_settings, false);
 
             try
             {
@@ -1183,7 +1391,7 @@ namespace Npgsql
                 cancelConnector.RawOpen(cancelConnector.ConnectionTimeout*1000);
 
                 // Cancel current request.
-                cancelConnector.SendCancelRequest();
+                cancelConnector.SendCancelRequest(BackEndKeyData);
             }
             finally
             {
@@ -1191,11 +1399,17 @@ namespace Npgsql
             }
         }
 
-        void SendCancelRequest()
+        void SendCancelRequest(NpgsqlBackEndKeyData backEndKeyData)
         {
-            var cancelRequestMessage = new NpgsqlCancelRequest(BackEndKeyData);
-            cancelRequestMessage.WriteToStream(Stream);
-            Stream.Flush();
+            const int len = 16;
+            const int cancelRequestCode = 1234 << 16 | 5678;
+
+            Stream
+                .WriteInt32(len)
+                .WriteInt32(cancelRequestCode)
+                .WriteInt32(backEndKeyData.ProcessID)
+                .WriteInt32(backEndKeyData.SecretKey)
+                .Flush();
         }
 
         #endregion Cancel
@@ -1211,13 +1425,13 @@ namespace Npgsql
 
             switch (State)
             {
-                case NpgsqlState.Closed:
+                case ConnectorState.Closed:
                     return;
-                case NpgsqlState.Ready:
+                case ConnectorState.Ready:
                     try
                     {
                         Stream
-                            .WriteBytes((byte)FrontEndMessageCode.Termination)
+                            .WriteByte(ASCIIByteArrays.TerminationMessageCode)
                             .WriteInt32(4)
                             .Flush();
                     }
@@ -1234,7 +1448,7 @@ namespace Npgsql
             Stream = null;
             _serverParameters.Clear();
             ServerVersion = null;
-            State = NpgsqlState.Closed;
+            State = ConnectorState.Closed;
         }
 
         /// <summary>
@@ -1242,7 +1456,7 @@ namespace Npgsql
         /// </summary>
         internal void ReleaseResources()
         {
-            if (State != NpgsqlState.Closed)
+            if (State != ConnectorState.Closed)
             {
                 if (SupportsDiscard)
                 {
@@ -1258,14 +1472,14 @@ namespace Npgsql
 
         internal void ReleaseWithDiscard()
         {
-            ExecuteBlind(NpgsqlQuery.DiscardAll);
+            ExecuteBlind(QueryManager.DiscardAll);
 
             // The initial connection parameters will be restored via IsValid() when get connector from pool later 
         }
 
         internal void ReleaseRegisteredListen()
         {
-            ExecuteBlind(NpgsqlQuery.UnlistenAll);
+            ExecuteBlind(QueryManager.UnlistenAll);
         }
 
         /// <summary>
@@ -1362,6 +1576,7 @@ namespace Npgsql
 
         void StopNotificationThread()
         {
+            return;  // Disable async notifications for now
             // first check to see if an exception has
             // been thrown by the notification thread.
             if (_notificationException != null)
@@ -1379,6 +1594,7 @@ namespace Npgsql
 
         void ResumeNotificationThread()
         {
+            return;  // Disable async notifications for now
             _notificationThreadStopCount--;
 
             if (_notificationThreadStopCount == 0)
@@ -1420,7 +1636,7 @@ namespace Npgsql
                             // 20 millisecond timeout
                             if (_connector.Socket.Poll(20000, SelectMode.SelectRead))
                             {
-                                _connector.ProcessAndDiscardBackendResponses();
+                                _connector.ConsumeAll();
                             }
                         }
                     }
@@ -1480,44 +1696,46 @@ namespace Npgsql
         /// Internal query shortcut for use in cases where the number
         /// of affected rows is of no interest.
         /// </summary>
-        internal void ExecuteBlind(string command)
+        [GenerateAsync]
+        internal void ExecuteBlind(string query)
         {
-            // Bypass cpmmand parsing overhead and send command verbatim.
-            ExecuteBlind(new NpgsqlQuery(command));
-        }
-
-        internal void ExecuteBlind(NpgsqlQuery query)
-        {
-            // Block the notification thread before writing anything to the wire.
             using (BlockNotificationThread())
             {
-                // Set statement timeout as needed.
                 SetBackendCommandTimeout(20);
-
-                // Write the Query message to the wire.
-                Query(query);
-
-                // Flush, and wait for and discard all responses.
-                ProcessAndDiscardBackendResponses();
+                SendQuery(query);
+                ConsumeAll();
             }
         }
 
-        internal void ExecuteBlindSuppressTimeout(string command)
+        [GenerateAsync]
+        internal void ExecuteBlind(byte[] query)
         {
-            // Bypass cpmmand parsing overhead and send command verbatim.
-            ExecuteBlindSuppressTimeout(new NpgsqlQuery(command));
+            using (BlockNotificationThread())
+            {
+                SetBackendCommandTimeout(20);
+                SendQueryRaw(query);
+                ConsumeAll();
+            }
         }
 
-        internal void ExecuteBlindSuppressTimeout(NpgsqlQuery query)
+        [GenerateAsync]
+        internal void ExecuteBlindSuppressTimeout(string query)
+        {
+            using (BlockNotificationThread())
+            {
+                SendQuery(query);
+                ConsumeAll();
+            }
+        }
+
+        [GenerateAsync]
+        internal void ExecuteBlindSuppressTimeout(byte[] query)
         {
             // Block the notification thread before writing anything to the wire.
             using (BlockNotificationThread())
             {
-                // Write the Query message to the wire.
-                Query(query);
-
-                // Flush, and wait for and discard all responses.
-                ProcessAndDiscardBackendResponses();
+                SendQueryRaw(query);
+                ConsumeAll();
             }
         }
 
@@ -1527,48 +1745,42 @@ namespace Npgsql
         /// which will cause an endless recursive loop.
         /// </summary>
         /// <param name="timeout">Timeout in seconds.</param>
+        [GenerateAsync]
         internal void ExecuteSetStatementTimeoutBlind(int timeout)
         {
-            NpgsqlQuery query;
-
             // Optimize for a few common timeout values.
             switch (timeout)
             {
                 case 10:
-                    query = NpgsqlQuery.SetStmtTimeout10Sec;
+                    SendQueryRaw(QueryManager.SetStmtTimeout10Sec);
                     break;
 
                 case 20:
-                    query = NpgsqlQuery.SetStmtTimeout20Sec;
+                    SendQueryRaw(QueryManager.SetStmtTimeout20Sec);
                     break;
 
                 case 30:
-                    query = NpgsqlQuery.SetStmtTimeout30Sec;
+                    SendQueryRaw(QueryManager.SetStmtTimeout30Sec);
                     break;
 
                 case 60:
-                    query = NpgsqlQuery.SetStmtTimeout60Sec;
+                    SendQueryRaw(QueryManager.SetStmtTimeout60Sec);
                     break;
 
                 case 90:
-                    query = NpgsqlQuery.SetStmtTimeout90Sec;
+                    SendQueryRaw(QueryManager.SetStmtTimeout90Sec);
                     break;
 
                 case 120:
-                    query = NpgsqlQuery.SetStmtTimeout120Sec;
+                    SendQueryRaw(QueryManager.SetStmtTimeout120Sec);
                     break;
 
                 default:
-                    query = new NpgsqlQuery(string.Format("SET statement_timeout = {0}", timeout * 1000));
+                    SendQuery(string.Format("SET statement_timeout = {0}", timeout * 1000));
                     break;
 
             }
-
-            // Write the Query message to the wire.
-            Query(query);
-
-            // Flush, and wait for and discard all responses.
-            ProcessAndDiscardBackendResponses();
+            ConsumeAll();
         }
 
         #endregion Execute blind
@@ -1596,6 +1808,7 @@ namespace Npgsql
         /// Modify the backend statement_timeout value if needed.
         /// </summary>
         /// <param name="timeout">New timeout</param>
+        [GenerateAsync]
         internal void SetBackendCommandTimeout(int timeout)
         {
             if (Mediator.BackendCommandTimeout == -1 || Mediator.BackendCommandTimeout != timeout)
@@ -1668,7 +1881,7 @@ namespace Npgsql
         // Unused, can be deleted?
         internal void TestConnector()
         {
-            NpgsqlSync.Default.WriteToStream(Stream);
+            SendSync();
             Stream.Flush();
             var buffer = new Queue<int>();
             //byte[] compareBuffer = new byte[6];
@@ -1718,7 +1931,7 @@ namespace Npgsql
     /// <summary>
     /// Expresses the exact state of a connector.
     /// </summary>
-    internal enum NpgsqlState
+    internal enum ConnectorState
     {
         /// <summary>
         /// The connector has either not yet been opened or has been closed.

@@ -113,6 +113,7 @@ namespace Npgsql.SqlGenerators
         {
             NpgsqlNativeTypeInfo typeInfo;
             System.Globalization.NumberFormatInfo ni = NpgsqlNativeTypeInfo.NumberFormat;
+            object value = _value;
             switch (_primitiveType)
             {
                 case PrimitiveTypeKind.Binary:
@@ -127,32 +128,99 @@ namespace Npgsql.SqlGenerators
                     sqlText.AppendFormat(ni, "TIMESTAMP WITH TIME ZONE '{0:o}'", _value);
                     break;
                 case PrimitiveTypeKind.Decimal:
-                    sqlText.AppendFormat(ni, "cast({0} as numeric)", _value);
+                    if ((decimal)_value < 0)
+                    {
+                        sqlText.AppendFormat(ni, "({0})::numeric", _value);
+                    }
+                    else
+                    {
+                        sqlText.AppendFormat(ni, "{0}::numeric", _value);
+                    }
                     break;
                 case PrimitiveTypeKind.Double:
-                    sqlText.AppendFormat(ni, "cast({0} as float8)", _value);
+                    if (double.IsNaN((double)_value))
+                    {
+                        sqlText.AppendFormat("'NaN'::float8");
+                    }
+                    else if (double.IsPositiveInfinity((double)_value))
+                    {
+                        sqlText.AppendFormat("'Infinity'::float8");
+                    }
+                    else if (double.IsNegativeInfinity((double)_value))
+                    {
+                        sqlText.AppendFormat("'-Infinity'::float8");
+                    }
+                    else if ((double)_value < 0)
+                    {
+                        sqlText.AppendFormat(ni, "({0:r})::float8", _value);
+                    }
+                    else
+                    {
+                        sqlText.AppendFormat(ni, "{0:r}::float8", _value);
+                    }
                     break;
-                case PrimitiveTypeKind.Byte:
-                case PrimitiveTypeKind.SByte:
                     // PostgreSQL has no support for bytes. int2 is used instead in Npgsql.
+                case PrimitiveTypeKind.Byte:
+                    value = (short)(byte)_value;
+                    goto case PrimitiveTypeKind.Int16;
+                case PrimitiveTypeKind.SByte:
+                    value = (short)(sbyte)_value;
+                    goto case PrimitiveTypeKind.Int16;
                 case PrimitiveTypeKind.Int16:
-                    sqlText.AppendFormat(ni, "cast({0} as int2)", _value);
+                    if ((short)value < 0)
+                    {
+                        sqlText.AppendFormat(ni, "({0})::int2", _value);
+                    }
+                    else
+                    {
+                        sqlText.AppendFormat(ni, "{0}::int2", _value);
+                    }
                     break;
                 case PrimitiveTypeKind.Int32:
                     sqlText.AppendFormat(ni, "{0}", _value);
                     break;
                 case PrimitiveTypeKind.Int64:
-                    sqlText.AppendFormat(ni, "cast({0} as int8)", _value);
+                    if ((long)_value < 0)
+                    {
+                        sqlText.AppendFormat(ni, "({0})::int8", _value);
+                    }
+                    else
+                    {
+                        sqlText.AppendFormat(ni, "{0}::int8", _value);
+                    }
                     break;
                 case PrimitiveTypeKind.Single:
-                    sqlText.AppendFormat(ni, "cast({0} as float4)", _value);
+                    if (float.IsNaN((float)_value))
+                    {
+                        sqlText.AppendFormat("'NaN'::float4");
+                    }
+                    else if (float.IsPositiveInfinity((float)_value))
+                    {
+                        sqlText.AppendFormat("'Infinity'::float4");
+                    }
+                    else if (float.IsNegativeInfinity((float)_value))
+                    {
+                        sqlText.AppendFormat("'-Infinity'::float4");
+                    }
+                    else if ((float)_value < 0)
+                    {
+                        sqlText.AppendFormat(ni, "({0:r})::float4", _value);
+                    }
+                    else
+                    {
+                        sqlText.AppendFormat(ni, "{0:r}::float4", _value);
+                    }
                     break;
                 case PrimitiveTypeKind.Boolean:
                     sqlText.Append(((bool)_value) ? "TRUE" : "FALSE");
                     break;
                 case PrimitiveTypeKind.Guid:
+                    NpgsqlTypesHelper.TryGetNativeTypeInfo(NpgsqlProviderManifest.GetDbType(_primitiveType), out typeInfo);
+                    sqlText.Append(BackendEncoding.UTF8Encoding.GetString(typeInfo.ConvertToBackend(_value, false)));
+                    sqlText.Append("::uuid");
+                    break;
                 case PrimitiveTypeKind.String:
-                    NpgsqlTypesHelper.TryGetNativeTypeInfo(GetDbType(_primitiveType), out typeInfo);
+                    NpgsqlTypesHelper.TryGetNativeTypeInfo(NpgsqlProviderManifest.GetDbType(_primitiveType), out typeInfo);
                     // Escape syntax is needed for strings with escape values.
                     // We don't check if there are escaped strings for performance reasons.
                     // Check https://github.com/franciscojunior/Npgsql2/pull/10 for more info.
@@ -168,21 +236,6 @@ namespace Npgsql.SqlGenerators
                     throw new NotSupportedException(string.Format("NotSupported: {0} {1}", _primitiveType, _value));
             }
             base.WriteSql(sqlText);
-        }
-
-        private DbType GetDbType(PrimitiveTypeKind _primitiveType)
-        {
-            switch (_primitiveType)
-            {
-                case PrimitiveTypeKind.Boolean:
-                    return DbType.Boolean;
-                case PrimitiveTypeKind.Guid:
-                    return DbType.Guid;
-                case PrimitiveTypeKind.String:
-                    return DbType.String;
-                default:
-                    return DbType.Object;
-            }
         }
     }
 
@@ -282,6 +335,19 @@ namespace Npgsql.SqlGenerators
         {
             sqlText.Append("UPDATE ");
             base.WriteSql(sqlText);
+        }
+
+        internal void AppendReturning(DbNewInstanceExpression expression)
+        {
+            Append(" RETURNING ");//Don't put () around columns it will probably have unwanted effect
+            bool first = true;
+            foreach (var returingProperty in expression.Arguments)
+            {
+                if (!first)
+                    Append(",");
+                Append(SqlBaseGenerator.QuoteIdentifier((returingProperty as DbPropertyExpression).Property.Name));
+                first = false;
+            }
         }
     }
 
