@@ -12,7 +12,7 @@ namespace NpgsqlTests
 	public class MultiConnectionTests : TestBase
 	{
 		public MultiConnectionTests(string backendVersion) : base(backendVersion) { }
-		
+
 		private class RequestHandle
 		{
 			public static readonly object syncRoot = new object();
