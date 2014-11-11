@@ -70,7 +70,7 @@ namespace NpgsqlTests
 			{
 				const string QuerySelect = "select 42 as result;";
 				const string QuerySleep = "SELECT pg_sleep(1);";
-				using (var connection = new NpgsqlConnection(ConnectionString + ";MaxPoolSize=0;MinPoolSize=15"))
+				using (var connection = new NpgsqlConnection(ConnectionString + ";MaxPoolSize=15;MinPoolSize=0"))
 				{
 					connection.Open();
 
