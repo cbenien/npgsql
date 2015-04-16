@@ -14,7 +14,7 @@ namespace Npgsql.SqlGenerators
 {
     internal abstract class SqlBaseGenerator : DbExpressionVisitor<VisitedExpression>
     {
-
+        protected NpgsqlProviderManifest _providerManifest;
         protected Dictionary<string, PendingProjectsNode> _refToNode = new Dictionary<string, PendingProjectsNode>();
         protected HashSet<InputExpression> _currentExpressions = new HashSet<InputExpression>();
         protected uint _aliasCounter = 0;
@@ -33,8 +33,9 @@ namespace Npgsql.SqlGenerators
             {"VarP","var_pop"},
         };
 
-        protected SqlBaseGenerator()
+        protected SqlBaseGenerator(NpgsqlProviderManifest providerManifest)
         {
+            _providerManifest = providerManifest;
         }
 
         private void EnterExpression(PendingProjectsNode n)
@@ -251,9 +252,25 @@ namespace Npgsql.SqlGenerators
                 case DbExpressionKind.Except:
                     {
                         DbBinaryExpression exp = (DbBinaryExpression)expression;
-                        PendingProjectsNode l = VisitInputWithBinding(exp.Left, bindingName + "_1");
-                        PendingProjectsNode r = VisitInputWithBinding(exp.Right, bindingName + "_2");
-                        InputExpression input = new InputExpression(new CombinedProjectionExpression(l.Last.Exp, expression.ExpressionKind, r.Last.Exp), bindingName);
+                        DbExpressionKind expKind = exp.ExpressionKind;
+                        List<VisitedExpression> list = new List<VisitedExpression>();
+                        Action<DbExpression> func = null;
+                        func = e =>
+                        {
+                            if (e.ExpressionKind == expKind && e.ExpressionKind != DbExpressionKind.Except)
+                            {
+                                DbBinaryExpression binaryExp = (DbBinaryExpression)e;
+                                func(binaryExp.Left);
+                                func(binaryExp.Right);
+                            }
+                            else
+                            {
+                                list.Add(VisitInputWithBinding(e, bindingName + "_" + list.Count).Last.Exp);
+                            }
+                        };
+                        func(exp.Left);
+                        func(exp.Right);
+                        InputExpression input = new InputExpression(new CombinedProjectionExpression(expression.ExpressionKind, list), bindingName);
                         n = new PendingProjectsNode(bindingName, input);
                         break;
                     }
@@ -724,7 +741,7 @@ namespace Npgsql.SqlGenerators
             // may require some formatting depending on the type
             //throw new NotImplementedException();
             // TODO: this is just for testing
-            return new ConstantExpression(expression.Value, expression.ResultType);
+            return new ConstantExpression(expression.Value, expression.ResultType, _providerManifest);
         }
 
         public override VisitedExpression Visit(DbComparisonExpression expression)
